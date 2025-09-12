@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import asyncio
-from .models import ChunkRecord
+
+from defind.core.models import ChunkRecord
 
 class LiveManifest:
     def __init__(self, path: str) -> None:

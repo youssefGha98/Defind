@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Sequence
 import httpx
 
-from .models import EventLog
+from defind.core.models import EventLog
+
 
 def _to_hex_block(x: int) -> str: return hex(x)
 def _topics_param(topic0s: Sequence[str]) -> list[list[str]]: return [[t.lower() for t in topic0s]]
