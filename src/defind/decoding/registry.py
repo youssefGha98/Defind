@@ -123,7 +123,7 @@ def make_default_registry() -> EventRegistry:
         projection={
             "owner":     "topic.user",               # adapter maps owner→GaugeRow.user
             "liquidity": "topic.liquidityToStake",   # adapter maps liquidity→GaugeRow.amount
-            "amount0":   "topic.tokenId",            # stash tokenId; adapter maps to GaugeRow.token_id
+            "token_id":   "topic.tokenId",            # stash tokenId; adapter maps to GaugeRow.token_id
         },
         fast_zero_words=(),
         drop_if_all_zero_fields=(),
@@ -143,7 +143,7 @@ def make_default_registry() -> EventRegistry:
         projection={
             "owner":     "topic.user",
             "liquidity": "topic.liquidityToStake",
-            "amount0":   "topic.tokenId",
+            "token_id":   "topic.tokenId",
         },
         fast_zero_words=(),
         drop_if_all_zero_fields=(),
@@ -158,7 +158,7 @@ def make_default_registry() -> EventRegistry:
         data_fields=[DataFieldSpec("amount", 0, "uint256")],
         projection={
             "owner":     "topic.from",
-            "liquidity": "data.amount",
+            "amount": "data.amount",
         },
         fast_zero_words=(),
         drop_if_all_zero_fields=(),
@@ -172,5 +172,3 @@ def add_event_spec(registry: EventRegistry, spec: EventSpec) -> None:
 def add_many(registry: EventRegistry, specs: Iterable[EventSpec]) -> None:
     for s in specs:
         add_event_spec(registry, s)
-
-

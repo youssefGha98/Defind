@@ -1,10 +1,20 @@
+# core.models.py
 from __future__ import annotations
-
-import json
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Literal
-
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Any, Literal
 import pyarrow as pa
+import json
+
+# === Dynamic universal buffer: any projection key becomes a column ===
+
+_BASE_FIELDS = [
+    ("block_number", pa.int64()),
+    ("block_timestamp", pa.int64()),
+    ("tx_hash", pa.string()),
+    ("log_index", pa.int32()),
+    ("contract", pa.string()),
+    ("event", pa.string()),
+]
 
 Status = Literal["started", "done", "failed"]
 
@@ -17,24 +27,6 @@ class EventLog:
     tx_hash: str                       # lowercased 0x...
     log_index: int
     block_timestamp: Optional[int] = None
-
-@dataclass(slots=True)
-class DecodedRow:
-    block_number: int
-    block_timestamp: int
-    tx_hash: str
-    log_index: int
-    pool: str
-    event: str                         # Mint | Burn | Collect | CollectFees
-    owner: Optional[str]
-    sender: Optional[str]
-    recipient: Optional[str]
-    tick_lower: int
-    tick_upper: int
-    liquidity: Optional[str]
-    amount0: Optional[str]
-    amount1: Optional[str]
-
 @dataclass(slots=True)
 class ChunkRecord:
     from_block: int
@@ -51,224 +43,136 @@ class ChunkRecord:
     def to_json_line(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":")) + "\n"
 
-# Arrow schema for decoded rows
-LP_SCHEMA = pa.schema([
-    pa.field("block_number",    pa.int64()),
-    pa.field("block_timestamp", pa.int64()),
-    pa.field("tx_hash",         pa.large_string()),
-    pa.field("log_index",       pa.int32()),
-    pa.field("pool",            pa.large_string()),
-    pa.field("event",           pa.large_string()),
-    pa.field("owner",           pa.large_string()),
-    pa.field("sender",          pa.large_string()),
-    pa.field("recipient",       pa.large_string()),
-    pa.field("tick_lower",      pa.int32()),
-    pa.field("tick_upper",      pa.int32()),
-    pa.field("liquidity",       pa.large_string()),
-    pa.field("amount0",         pa.large_string()),
-    pa.field("amount1",         pa.large_string()),
-])
-DECODED_COLS: tuple[str, ...] = tuple(f.name for f in LP_SCHEMA)
 
-@dataclass(slots=True)
-class DecodedColumns:
-    block_number: List[int]
-    block_timestamp: List[int]
-    tx_hash: List[str]
-    log_index: List[int]
-    pool: List[str]
-    event: List[str]
-    owner: List[Optional[str]]
-    sender: List[Optional[str]]
-    recipient: List[Optional[str]]
-    tick_lower: List[int]
-    tick_upper: List[int]
-    liquidity: List[Optional[str]]
-    amount0: List[Optional[str]]
-    amount1: List[Optional[str]]
+@dataclass
+class UniversalDynColumns:
+    # base
+    block_number: List[int] = field(default_factory=list)
+    block_timestamp: List[int] = field(default_factory=list)
+    tx_hash: List[str] = field(default_factory=list)
+    log_index: List[int] = field(default_factory=list)
+    contract: List[str] = field(default_factory=list)
+    event: List[str] = field(default_factory=list)
 
-    @classmethod
-    def empty(cls) -> "DecodedColumns":
-        return cls(
-            block_number=[], block_timestamp=[], tx_hash=[], log_index=[],
-            pool=[], event=[], owner=[], sender=[], recipient=[],
-            tick_lower=[], tick_upper=[], liquidity=[], amount0=[], amount1=[]
-        )
+    # dynamic columns: name -> list
+    dyn: Dict[str, List[Optional[str]]] = field(default_factory=dict)
+    _rows: int = 0
 
-    def append(self, row: DecodedRow) -> None:
-        self.block_number.append(row.block_number)
-        self.block_timestamp.append(row.block_timestamp)
-        self.tx_hash.append(row.tx_hash)
-        self.log_index.append(row.log_index)
-        self.pool.append(row.pool)
-        self.event.append(row.event)
-        self.owner.append(row.owner)
-        self.sender.append(row.sender)
-        self.recipient.append(row.recipient)
-        self.tick_lower.append(row.tick_lower)
-        self.tick_upper.append(row.tick_upper)
-        self.liquidity.append(row.liquidity)
-        self.amount0.append(row.amount0)
-        self.amount1.append(row.amount1)
+    @staticmethod
+    def empty() -> "UniversalDynColumns":
+        return UniversalDynColumns()
 
     def size(self) -> int:
-        return len(self.tx_hash)
+        return self._rows
 
-    def take_first(self, n: int) -> "DecodedColumns":
-        out = DecodedColumns(
-            block_number=self.block_number[:n],
-            block_timestamp=self.block_timestamp[:n],
-            tx_hash=self.tx_hash[:n],
-            log_index=self.log_index[:n],
-            pool=self.pool[:n],
-            event=self.event[:n],
-            owner=self.owner[:n],
-            sender=self.sender[:n],
-            recipient=self.recipient[:n],
-            tick_lower=self.tick_lower[:n],
-            tick_upper=self.tick_upper[:n],
-            liquidity=self.liquidity[:n],
-            amount0=self.amount0[:n],
-            amount1=self.amount1[:n],
+    def _append_base(self, *, block_number:int, block_timestamp:int, tx_hash:str, log_index:int, contract:str, event:str) -> None:
+        self.block_number.append(int(block_number))
+        self.block_timestamp.append(int(block_timestamp or 0))
+        self.tx_hash.append(str(tx_hash))
+        self.log_index.append(int(log_index))
+        self.contract.append(str(contract))
+        self.event.append(str(event))
+        self._rows += 1
+        # pad existing dyn columns for the new row
+        for col in self.dyn.values():
+            col.append(None)
+
+    def _ensure_dyn_col(self, name: str) -> List[Optional[str]]:
+        col = self.dyn.get(name)
+        if col is None:
+            col = [None] * self._rows
+            self.dyn[name] = col
+        return col
+
+    def append_from_parsed(self, *, pe_name: str, meta, values: Dict[str, Any], contract_addr: str) -> None:
+        self._append_base(
+            block_number=meta.block_number,
+            block_timestamp=meta.block_timestamp or 0,
+            tx_hash=meta.tx_hash,
+            log_index=meta.log_index,
+            contract=contract_addr,
+            event=pe_name,
         )
-        # shrink current
-        self.block_number = self.block_number[n:]
-        self.block_timestamp = self.block_timestamp[n:]
-        self.tx_hash = self.tx_hash[n:]
-        self.log_index = self.log_index[n:]
-        self.pool = self.pool[n:]
-        self.event = self.event[n:]
-        self.owner = self.owner[n:]
-        self.sender = self.sender[n:]
-        self.recipient = self.recipient[n:]
-        self.tick_lower = self.tick_lower[n:]
-        self.tick_upper = self.tick_upper[n:]
-        self.liquidity = self.liquidity[n:]
-        self.amount0 = self.amount0[n:]
-        self.amount1 = self.amount1[n:]
+        # every key becomes a column (stored as string for safety)
+        for k, v in values.items():
+            if v is None:
+                sval = None
+            else:
+                sval = str(v)
+            self._ensure_dyn_col(k)[-1] = sval
+
+    def extend(self, other: "UniversalDynColumns") -> int:
+        """
+        Merge `other` into self. Align dynamic columns by name; pad with None where absent.
+        """
+        n = other.size()
+        if n == 0:
+            return 0
+
+        # Snapshot current row count BEFORE we extend base arrays
+        old_rows = self._rows
+
+        # 1) extend base arrays
+        self.block_number.extend(other.block_number)
+        self.block_timestamp.extend(other.block_timestamp)
+        self.tx_hash.extend(other.tx_hash)
+        self.log_index.extend(other.log_index)
+        self.contract.extend(other.contract)
+        self.event.extend(other.event)
+        self._rows += n  # now = old_rows + n
+
+        # 2) union of dynamic keys
+        keys: set[str] = set(self.dyn.keys()) | set(other.dyn.keys())
+
+        # 3) make sure each key exists and is correctly aligned
+        for k in keys:
+            if k not in self.dyn:
+                # NEW column: fill rows that existed BEFORE this extend with None
+                self.dyn[k] = [None] * old_rows
+
+            self_col = self.dyn[k]
+            ocol = other.dyn.get(k)
+
+            if ocol is None:
+                # other has no such column → pad n Nones for the rows we just added
+                self_col.extend([None] * n)
+            else:
+                # append the other column's n values for the rows we just added
+                self_col.extend(ocol)
+
+        return n
+
+
+    def take_first(self, n: int) -> "UniversalDynColumns":
+        out = UniversalDynColumns()
+        out.block_number, self.block_number = self.block_number[:n], self.block_number[n:]
+        out.block_timestamp, self.block_timestamp = self.block_timestamp[:n], self.block_timestamp[n:]
+        out.tx_hash, self.tx_hash = self.tx_hash[:n], self.tx_hash[n:]
+        out.log_index, self.log_index = self.log_index[:n], self.log_index[n:]
+        out.contract, self.contract = self.contract[:n], self.contract[n:]
+        out.event, self.event = self.event[:n], self.event[n:]
+        for k, col in self.dyn.items():
+            out.dyn[k] = col[:n]
+            self.dyn[k] = col[n:]
+        out._rows = n
+        self._rows -= n
         return out
 
     def to_arrow_table(self) -> pa.Table:
+        fields = [pa.field(n, t) for n, t in _BASE_FIELDS]
         arrays = {
-            "block_number":    pa.array(self.block_number,    type=LP_SCHEMA.field("block_number").type),
-            "block_timestamp": pa.array(self.block_timestamp, type=LP_SCHEMA.field("block_timestamp").type),
-            "tx_hash":         pa.array(self.tx_hash,         type=LP_SCHEMA.field("tx_hash").type),
-            "log_index":       pa.array(self.log_index,       type=LP_SCHEMA.field("log_index").type),
-            "pool":            pa.array(self.pool,            type=LP_SCHEMA.field("pool").type),
-            "event":           pa.array(self.event,           type=LP_SCHEMA.field("event").type),
-            "owner":           pa.array(self.owner,           type=LP_SCHEMA.field("owner").type),
-            "sender":          pa.array(self.sender,          type=LP_SCHEMA.field("sender").type),
-            "recipient":       pa.array(self.recipient,       type=LP_SCHEMA.field("recipient").type),
-            "tick_lower":      pa.array(self.tick_lower,      type=LP_SCHEMA.field("tick_lower").type),
-            "tick_upper":      pa.array(self.tick_upper,      type=LP_SCHEMA.field("tick_upper").type),
-            "liquidity":       pa.array(self.liquidity,       type=LP_SCHEMA.field("liquidity").type),
-            "amount0":         pa.array(self.amount0,         type=LP_SCHEMA.field("amount0").type),
-            "amount1":         pa.array(self.amount1,         type=LP_SCHEMA.field("amount1").type),
+            "block_number": pa.array(self.block_number, type=pa.int64()),
+            "block_timestamp": pa.array(self.block_timestamp, type=pa.int64()),
+            "tx_hash": pa.array(self.tx_hash, type=pa.string()),
+            "log_index": pa.array(self.log_index, type=pa.int32()),
+            "contract": pa.array(self.contract, type=pa.string()),
+            "event": pa.array(self.event, type=pa.string()),
         }
-        return pa.Table.from_pydict(arrays, schema=LP_SCHEMA).sort_by([
-            ("block_number", "ascending"),
-            ("tx_hash", "ascending"),
-            ("log_index", "ascending"),
+        # deterministic ordering of dynamic cols
+        for name in sorted(self.dyn.keys()):
+            fields.append(pa.field(name, pa.string()))
+            arrays[name] = pa.array(self.dyn[name], type=pa.string())
+        schema = pa.schema(fields)
+        return pa.Table.from_pydict(arrays, schema=schema).sort_by([
+            ("block_number","ascending"), ("tx_hash","ascending"), ("log_index","ascending")
         ])
-
-
-GAUGE_SCHEMA = pa.schema([
-    pa.field("block_number",    pa.int64()),
-    pa.field("block_timestamp", pa.int64()),
-    pa.field("tx_hash",         pa.large_string()),
-    pa.field("log_index",       pa.int32()),
-    pa.field("gauge",           pa.large_string()),
-    pa.field("event",           pa.large_string()),     # Deposit | Withdraw | Claim | NotifyReward | Transfer ...
-    pa.field("user",            pa.large_string()),     # staker / account / from
-    pa.field("recipient",       pa.large_string()),     # to (where relevant)
-    pa.field("token_id",        pa.large_string()),     # for NFT-style gauges; keep as string to be safe
-    pa.field("amount",          pa.large_string()),     # main numeric
-    pa.field("amount0",         pa.large_string()),     # optional
-    pa.field("amount1",         pa.large_string()),     # optional
-    pa.field("reward_token",    pa.large_string()),     # optional (for NotifyReward etc.)
-])
-
-@dataclass(slots=True)
-class GaugeRow:
-    block_number: int
-    block_timestamp: int
-    tx_hash: str
-    log_index: int
-    gauge: str
-    event: str
-    user: Optional[str] = None
-    recipient: Optional[str] = None
-    token_id: Optional[str] = None
-    amount: Optional[str] = None
-    amount0: Optional[str] = None
-    amount1: Optional[str] = None
-    reward_token: Optional[str] = None
-
-@dataclass(slots=True)
-class GaugeColumns:
-    block_number: List[int]
-    block_timestamp: List[int]
-    tx_hash: List[str]
-    log_index: List[int]
-    gauge: List[str]
-    event: List[str]
-    user: List[Optional[str]]
-    recipient: List[Optional[str]]
-    token_id: List[Optional[str]]
-    amount: List[Optional[str]]
-    amount0: List[Optional[str]]
-    amount1: List[Optional[str]]
-    reward_token: List[Optional[str]]
-
-    @classmethod
-    def empty(cls) -> "GaugeColumns":
-        return cls([],[],[],[],[],[],[],[],[],[],[],[],[])
-
-    def append(self, r: GaugeRow) -> None:
-        self.block_number.append(r.block_number)
-        self.block_timestamp.append(r.block_timestamp)
-        self.tx_hash.append(r.tx_hash)
-        self.log_index.append(r.log_index)
-        self.gauge.append(r.gauge)
-        self.event.append(r.event)
-        self.user.append(r.user)
-        self.recipient.append(r.recipient)
-        self.token_id.append(r.token_id)
-        self.amount.append(r.amount)
-        self.amount0.append(r.amount0)
-        self.amount1.append(r.amount1)
-        self.reward_token.append(r.reward_token)
-
-    def size(self) -> int: return len(self.tx_hash)
-
-    def take_first(self, n: int) -> "GaugeColumns":
-        out = GaugeColumns(
-            self.block_number[:n], self.block_timestamp[:n], self.tx_hash[:n], self.log_index[:n],
-            self.gauge[:n], self.event[:n], self.user[:n], self.recipient[:n], self.token_id[:n],
-            self.amount[:n], self.amount0[:n], self.amount1[:n], self.reward_token[:n]
-        )
-        self.block_number = self.block_number[n:]; self.block_timestamp = self.block_timestamp[n:]
-        self.tx_hash = self.tx_hash[n:]; self.log_index = self.log_index[n:]
-        self.gauge = self.gauge[n:]; self.event = self.event[n:]
-        self.user = self.user[n:]; self.recipient = self.recipient[n:]; self.token_id = self.token_id[n:]
-        self.amount = self.amount[n:]; self.amount0 = self.amount0[n:]; self.amount1 = self.amount1[n:]; self.reward_token = self.reward_token[n:]
-        return out
-
-    def to_arrow_table(self) -> pa.Table:
-        import pyarrow as pa
-        fields = {f.name: GAUGE_SCHEMA.field(f.name).type for f in GAUGE_SCHEMA}
-        return pa.Table.from_pydict({
-            "block_number":    pa.array(self.block_number,    type=fields["block_number"]),
-            "block_timestamp": pa.array(self.block_timestamp, type=fields["block_timestamp"]),
-            "tx_hash":         pa.array(self.tx_hash,         type=fields["tx_hash"]),
-            "log_index":       pa.array(self.log_index,       type=fields["log_index"]),
-            "gauge":           pa.array(self.gauge,           type=fields["gauge"]),
-            "event":           pa.array(self.event,           type=fields["event"]),
-            "user":            pa.array(self.user,            type=fields["user"]),
-            "recipient":       pa.array(self.recipient,       type=fields["recipient"]),
-            "token_id":        pa.array(self.token_id,        type=fields["token_id"]),
-            "amount":          pa.array(self.amount,          type=fields["amount"]),
-            "amount0":         pa.array(self.amount0,         type=fields["amount0"]),
-            "amount1":         pa.array(self.amount1,         type=fields["amount1"]),
-            "reward_token":    pa.array(self.reward_token,    type=fields["reward_token"]),
-        }).sort_by([("block_number","ascending"),("tx_hash","ascending"),("log_index","ascending")])
