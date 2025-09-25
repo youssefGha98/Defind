@@ -1,13 +1,30 @@
-# core.models.py
+"""Core data models and dynamic column buffer (universal layout).
+
+This module defines:
+- `EventLog`: minimal RPC log record used by the decoder.
+- `ChunkRecord`: manifest entry used for resumability and coverage.
+- `UniversalDynColumns`: dynamic, append-only columnar buffer where *any*
+   projection key becomes its own Parquet column.
+
+Design notes
+------------
+- Dynamic columns are stored as strings for Arrow safety (big ints, hex).
+- Base columns are strongly typed and always present.
+- `extend` aligns dynamic columns by name and pads with None as needed.
+- Sorting is applied on (block_number, tx_hash, log_index) before write.
+"""
+
 from __future__ import annotations
+
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Any, Literal
-import pyarrow as pa
+from typing import Any, Literal
+
 import json
+import pyarrow as pa
 
-# === Dynamic universal buffer: any projection key becomes a column ===
+# === Base schema (Arrow) ===
 
-_BASE_FIELDS = [
+_BASE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("block_number", pa.int64()),
     ("block_timestamp", pa.int64()),
     ("tx_hash", pa.string()),
@@ -18,22 +35,31 @@ _BASE_FIELDS = [
 
 Status = Literal["started", "done", "failed"]
 
+
+# === RPC record ===
+
 @dataclass(slots=True, frozen=True)
 class EventLog:
-    address: str                       # lowercased hex with 0x
-    topics: tuple[str, ...]            # all topics, lowercased with 0x
-    data_hex: str                      # hex with 0x (or "0x")
+    """Raw log as fetched from RPC, minimally normalized."""
+    address: str                    # lowercased 0x...
+    topics: tuple[str, ...]         # lowercased 0x...
+    data_hex: str                   # "0x..."
     block_number: int
-    tx_hash: str                       # lowercased 0x...
+    tx_hash: str                    # lowercased 0x...
     log_index: int
-    block_timestamp: Optional[int] = None
+    block_timestamp: int | None = None
+
+
+# === Manifest record ===
+
 @dataclass(slots=True)
 class ChunkRecord:
+    """A single chunk execution record persisted to the live manifest."""
     from_block: int
     to_block: int
     status: Status
     attempts: int
-    error: Optional[str]
+    error: str | None
     logs: int              # raw logs fetched
     decoded: int           # kept rows
     shards: int            # shard files written due to this chunk
@@ -41,31 +67,53 @@ class ChunkRecord:
     filtered: int = 0      # rows skipped by fast filter
 
     def to_json_line(self) -> str:
+        """Serialize as a compact JSON line."""
         return json.dumps(asdict(self), separators=(",", ":")) + "\n"
 
 
-@dataclass
-class UniversalDynColumns:
-    # base
-    block_number: List[int] = field(default_factory=list)
-    block_timestamp: List[int] = field(default_factory=list)
-    tx_hash: List[str] = field(default_factory=list)
-    log_index: List[int] = field(default_factory=list)
-    contract: List[str] = field(default_factory=list)
-    event: List[str] = field(default_factory=list)
+# === Dynamic column buffer ===
 
-    # dynamic columns: name -> list
-    dyn: Dict[str, List[Optional[str]]] = field(default_factory=dict)
+@dataclass(slots=True)
+class UniversalDynColumns:
+    """Dynamic columnar buffer (universal projection-first layout).
+
+    - Base columns are always present and strongly typed.
+    - Dynamic columns are created lazily upon first key appearance.
+    - All dynamic values are stored as *strings* (or None) to avoid Arrow
+      overflow and preserve exactness (e.g., uint256).
+    """
+    # base
+    block_number: list[int] = field(default_factory=list)
+    block_timestamp: list[int] = field(default_factory=list)
+    tx_hash: list[str] = field(default_factory=list)
+    log_index: list[int] = field(default_factory=list)
+    contract: list[str] = field(default_factory=list)
+    event: list[str] = field(default_factory=list)
+
+    # dynamic columns: name -> list[str | None]
+    dyn: dict[str, list[str | None]] = field(default_factory=dict)
     _rows: int = 0
 
     @staticmethod
-    def empty() -> "UniversalDynColumns":
+    def empty() -> UniversalDynColumns:
+        """Return an empty buffer."""
         return UniversalDynColumns()
 
     def size(self) -> int:
+        """Number of rows currently stored."""
         return self._rows
 
-    def _append_base(self, *, block_number:int, block_timestamp:int, tx_hash:str, log_index:int, contract:str, event:str) -> None:
+    def _append_base(
+        self,
+        *,
+        block_number: int,
+        block_timestamp: int,
+        tx_hash: str,
+        log_index: int,
+        contract: str,
+        event: str,
+    ) -> None:
+        """Append one row to base columns and pad existing dynamic cols."""
         self.block_number.append(int(block_number))
         self.block_timestamp.append(int(block_timestamp or 0))
         self.tx_hash.append(str(tx_hash))
@@ -77,14 +125,23 @@ class UniversalDynColumns:
         for col in self.dyn.values():
             col.append(None)
 
-    def _ensure_dyn_col(self, name: str) -> List[Optional[str]]:
+    def _ensure_dyn_col(self, name: str) -> list[str | None]:
+        """Ensure a dynamic column exists and is aligned to current row count."""
         col = self.dyn.get(name)
         if col is None:
             col = [None] * self._rows
             self.dyn[name] = col
         return col
 
-    def append_from_parsed(self, *, pe_name: str, meta, values: Dict[str, Any], contract_addr: str) -> None:
+    def append_from_parsed(
+        self,
+        *,
+        pe_name: str,
+        meta,
+        values: dict[str, Any],
+        contract_addr: str,
+    ) -> None:
+        """Append a decoded event into the buffer (all keys become columns)."""
         self._append_base(
             block_number=meta.block_number,
             block_timestamp=meta.block_timestamp or 0,
@@ -95,16 +152,11 @@ class UniversalDynColumns:
         )
         # every key becomes a column (stored as string for safety)
         for k, v in values.items():
-            if v is None:
-                sval = None
-            else:
-                sval = str(v)
+            sval: str | None = None if v is None else str(v)
             self._ensure_dyn_col(k)[-1] = sval
 
-    def extend(self, other: "UniversalDynColumns") -> int:
-        """
-        Merge `other` into self. Align dynamic columns by name; pad with None where absent.
-        """
+    def extend(self, other: UniversalDynColumns) -> int:
+        """Merge `other` into self; align dynamic columns by name."""
         n = other.size()
         if n == 0:
             return 0
@@ -142,8 +194,8 @@ class UniversalDynColumns:
 
         return n
 
-
-    def take_first(self, n: int) -> "UniversalDynColumns":
+    def take_first(self, n: int) -> UniversalDynColumns:
+        """Detach and return the first `n` rows as a new buffer slice."""
         out = UniversalDynColumns()
         out.block_number, self.block_number = self.block_number[:n], self.block_number[n:]
         out.block_timestamp, self.block_timestamp = self.block_timestamp[:n], self.block_timestamp[n:]
@@ -159,8 +211,9 @@ class UniversalDynColumns:
         return out
 
     def to_arrow_table(self) -> pa.Table:
+        """Convert the buffer to a sorted Arrow table with deterministic schema."""
         fields = [pa.field(n, t) for n, t in _BASE_FIELDS]
-        arrays = {
+        arrays: dict[str, pa.Array] = {
             "block_number": pa.array(self.block_number, type=pa.int64()),
             "block_timestamp": pa.array(self.block_timestamp, type=pa.int64()),
             "tx_hash": pa.array(self.tx_hash, type=pa.string()),
@@ -173,6 +226,6 @@ class UniversalDynColumns:
             fields.append(pa.field(name, pa.string()))
             arrays[name] = pa.array(self.dyn[name], type=pa.string())
         schema = pa.schema(fields)
-        return pa.Table.from_pydict(arrays, schema=schema).sort_by([
-            ("block_number","ascending"), ("tx_hash","ascending"), ("log_index","ascending")
-        ])
+        return pa.Table.from_pydict(arrays, schema=schema).sort_by(
+            [("block_number", "ascending"), ("tx_hash", "ascending"), ("log_index", "ascending")]
+        )

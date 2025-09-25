@@ -29,6 +29,8 @@ debugpy==1.8.16
     # via ipykernel
 decorator==5.2.1
     # via ipython
+duckdb==1.4.0
+    # via defind
 eth-abi==5.2.0
     # via defind
 eth-hash==0.7.1

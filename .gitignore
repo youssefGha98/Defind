@@ -9,5 +9,14 @@ wheels/
 # venv
 .venv
 
-data
+# data directories
+data/
+data2/
+src/defind/data/
+src/defind/data2/
+*.parquet
+*.jsonl
+
+# notebooks and test files
 test.ipynb
+*.ipynb
