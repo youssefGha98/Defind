@@ -9,7 +9,7 @@ Features
 
 Public API
 ----------
-`fetch_decode_streaming_universal(...)` → dict[str, int] summary.
+`fetch_decode(...)` → dict[str, int] summary.
 """
 
 from __future__ import annotations
@@ -21,17 +21,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from defind.clients.rpc import RPC
-from defind.decoding.decoder import Meta, decode_to_parsed_event
+from defind.decoding.decoder import Meta, decode_event
 from defind.decoding.specs import EventRegistry
 from defind.storage.manifest import LiveManifest
-from defind.storage.shards import ShardAggregatorUniversal
+from defind.storage.shards import ShardWriter
 from defind.orchestration.utils import (
     iter_chunks,
     load_done_coverage,
     subtract_iv,
     topics_fingerprint,
 )
-from defind.core.models import ChunkRecord, UniversalDynColumns
+from defind.core.models import ChunkRecord, Column
 
 
 # -------------------------
@@ -50,7 +50,7 @@ class ProcessContext:
     sem: asyncio.Semaphore
     agg_lock: asyncio.Lock
     manifest: LiveManifest
-    aggregator: ShardAggregatorUniversal
+    aggregator: ShardWriter
     stats: dict[str, int]
 
 
@@ -67,7 +67,7 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
             ctx.stats["executed_subranges"] += 1
             ctx.stats["total_logs"] += len(logs)
 
-            buf = UniversalDynColumns.empty()
+            buf = Column.empty()
             rows_in_batch = 0
             decoded_rows = 0
             filtered_rows = 0
@@ -84,7 +84,7 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
 
                 meta = Meta(ev.block_number, ev.block_timestamp, ev.tx_hash, ev.log_index, ev.address)
 
-                pe = decode_to_parsed_event(topics=ev.topics, data=data_bytes, meta=meta, registry=ctx.registry)
+                pe = decode_event(topics=ev.topics, data=data_bytes, meta=meta, registry=ctx.registry)
                 if pe is None:
                     filtered_rows += 1
                     continue
@@ -98,7 +98,7 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
                     async with ctx.agg_lock:
                         written = ctx.aggregator.add(buf)
                     shards_here += len(written)
-                    buf = UniversalDynColumns.empty()
+                    buf = Column.empty()
                     rows_in_batch = 0
 
             # Flush last partial batch for this interval
@@ -129,7 +129,49 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
 # Orchestrator
 # -------------------------
 
-async def fetch_decode_streaming_universal(
+def _setup_directories(out_root: str, address: str, topic0s: list[str]) -> tuple[str, str]:
+    """Setup output directories for the fetch operation.
+    
+    Returns:
+        Tuple of (key_dir, manifests_dir)
+    """
+    address_lc = address.lower()
+    topics_fp = topics_fingerprint(topic0s)
+    key_dir = os.path.join(out_root, f"{address_lc}__topics-{topics_fp}__universal")
+    manifests_dir = os.path.join(key_dir, "manifests")
+    os.makedirs(manifests_dir, exist_ok=True)
+    return key_dir, manifests_dir
+
+
+async def _resolve_block_range(rpc: RPC, start_block: int | str, end_block: int | str) -> tuple[int, int]:
+    """Resolve start and end blocks, handling special values like 'latest'.
+    
+    Returns:
+        Tuple of (start, end) as integers
+    """
+    start = 0 if (isinstance(start_block, str) and start_block.lower() in ("earliest", "genesis")) else int(start_block)
+    end = await rpc.latest_block() if (isinstance(end_block, str) and end_block.lower() == "latest") else int(end_block)
+    
+    if start > end:
+        raise ValueError("start_block must be <= end_block")
+    
+    return start, end
+
+
+def _build_work_seeds(start: int, end: int, step: int, covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Build list of uncovered block ranges to process.
+    
+    Returns:
+        List of (start_block, end_block) tuples to process
+    """
+    seeds: list[tuple[int, int]] = []
+    for uncovered_start, uncovered_end in subtract_iv((start, end), covered):
+        for a, b in iter_chunks(uncovered_start, uncovered_end, step):
+            seeds.append((a, b))
+    return seeds
+
+
+async def fetch_decode(
     *,
     rpc_url: str,
     address: str,
@@ -156,28 +198,24 @@ async def fetch_decode_streaming_universal(
     if not registry:
         raise ValueError("Registry is empty. Compose a registry (e.g., CL pool + Gauge) and pass it explicitly.")
 
-    address_lc = address.lower()
-    topics_fp = topics_fingerprint(topic0s)
-    key_dir = os.path.join(out_root, f"{address_lc}__topics-{topics_fp}__universal")
-    manifests_dir = os.path.join(key_dir, "manifests")
-    os.makedirs(manifests_dir, exist_ok=True)
-
+    # Setup directories and RPC client
+    key_dir, manifests_dir = _setup_directories(out_root, address, topic0s)
     rpc = RPC(rpc_url, timeout_s=timeout_s, max_connections=max(32, 2 * concurrency))
+    
     try:
-        start = 0 if (isinstance(start_block, str) and start_block.lower() in ("earliest", "genesis")) else int(start_block)
-        end = await rpc.latest_block() if (isinstance(end_block, str) and end_block.lower() == "latest") else int(end_block)
-        if start > end:
-            raise ValueError("start_block must be <= end_block")
-
+        # Resolve block range
+        start, end = await _resolve_block_range(rpc, start_block, end_block)
+        
+        # Setup manifest and coverage
+        address_lc = address.lower()
+        topics_fp = topics_fingerprint(topic0s)
         run_basename = f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_{address_lc}_{topics_fp}_{start}_{end}.jsonl"
         manifest = LiveManifest(os.path.join(manifests_dir, run_basename))
         covered = load_done_coverage(manifests_dir, exclude_basename=run_basename)
+        
+        # Build work list
+        seeds = _build_work_seeds(start, end, step, covered)
 
-        # Build unprocessed seeds, then split into step-sized chunks
-        seeds: list[tuple[int, int]] = []
-        for uncovered_start, uncovered_end in subtract_iv((start, end), covered):
-            for a, b in iter_chunks(uncovered_start, uncovered_end, step):
-                seeds.append((a, b))
 
         if not seeds:
             return {
@@ -189,7 +227,7 @@ async def fetch_decode_streaming_universal(
                 "shards_written": 0,
             }
 
-        aggregator = ShardAggregatorUniversal(
+        aggregator = ShardWriter(
             out_root,
             address_lc,
             topics_fp,

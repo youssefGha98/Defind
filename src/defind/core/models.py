@@ -3,7 +3,7 @@
 This module defines:
 - `EventLog`: minimal RPC log record used by the decoder.
 - `ChunkRecord`: manifest entry used for resumability and coverage.
-- `UniversalDynColumns`: dynamic, append-only columnar buffer where *any*
+- `Column`: dynamic, append-only columnar buffer where *any*
    projection key becomes its own Parquet column.
 
 Design notes
@@ -74,7 +74,7 @@ class ChunkRecord:
 # === Dynamic column buffer ===
 
 @dataclass(slots=True)
-class UniversalDynColumns:
+class Column:
     """Dynamic columnar buffer (universal projection-first layout).
 
     - Base columns are always present and strongly typed.
@@ -82,7 +82,6 @@ class UniversalDynColumns:
     - All dynamic values are stored as *strings* (or None) to avoid Arrow
       overflow and preserve exactness (e.g., uint256).
     """
-    # base
     block_number: list[int] = field(default_factory=list)
     block_timestamp: list[int] = field(default_factory=list)
     tx_hash: list[str] = field(default_factory=list)
@@ -90,14 +89,14 @@ class UniversalDynColumns:
     contract: list[str] = field(default_factory=list)
     event: list[str] = field(default_factory=list)
 
-    # dynamic columns: name -> list[str | None]
+    # Dynamic columns created on-demand for any projection key
     dyn: dict[str, list[str | None]] = field(default_factory=dict)
     _rows: int = 0
 
     @staticmethod
-    def empty() -> UniversalDynColumns:
+    def empty() -> Column:
         """Return an empty buffer."""
-        return UniversalDynColumns()
+        return Column()
 
     def size(self) -> int:
         """Number of rows currently stored."""
@@ -121,7 +120,7 @@ class UniversalDynColumns:
         self.contract.append(str(contract))
         self.event.append(str(event))
         self._rows += 1
-        # pad existing dyn columns for the new row
+        # Pad existing dynamic columns with None for the new row
         for col in self.dyn.values():
             col.append(None)
 
@@ -150,12 +149,12 @@ class UniversalDynColumns:
             contract=contract_addr,
             event=pe_name,
         )
-        # every key becomes a column (stored as string for safety)
+        # Convert all projection values to strings for Arrow compatibility
         for k, v in values.items():
             sval: str | None = None if v is None else str(v)
             self._ensure_dyn_col(k)[-1] = sval
 
-    def extend(self, other: UniversalDynColumns) -> int:
+    def extend(self, other: Column) -> int:
         """Merge `other` into self; align dynamic columns by name."""
         n = other.size()
         if n == 0:
@@ -171,7 +170,7 @@ class UniversalDynColumns:
         self.log_index.extend(other.log_index)
         self.contract.extend(other.contract)
         self.event.extend(other.event)
-        self._rows += n  # now = old_rows + n
+        self._rows += n
 
         # 2) union of dynamic keys
         keys: set[str] = set(self.dyn.keys()) | set(other.dyn.keys())
@@ -186,17 +185,17 @@ class UniversalDynColumns:
             ocol = other.dyn.get(k)
 
             if ocol is None:
-                # other has no such column → pad n Nones for the rows we just added
+                # Pad missing column with None for new rows
                 self_col.extend([None] * n)
             else:
-                # append the other column's n values for the rows we just added
+                # Append values from other buffer
                 self_col.extend(ocol)
 
         return n
 
-    def take_first(self, n: int) -> UniversalDynColumns:
+    def take_first(self, n: int) -> Column:
         """Detach and return the first `n` rows as a new buffer slice."""
-        out = UniversalDynColumns()
+        out = Column()
         out.block_number, self.block_number = self.block_number[:n], self.block_number[n:]
         out.block_timestamp, self.block_timestamp = self.block_timestamp[:n], self.block_timestamp[n:]
         out.tx_hash, self.tx_hash = self.tx_hash[:n], self.tx_hash[n:]
@@ -221,7 +220,7 @@ class UniversalDynColumns:
             "contract": pa.array(self.contract, type=pa.string()),
             "event": pa.array(self.event, type=pa.string()),
         }
-        # deterministic ordering of dynamic cols
+        # Add dynamic columns in deterministic order
         for name in sorted(self.dyn.keys()):
             fields.append(pa.field(name, pa.string()))
             arrays[name] = pa.array(self.dyn[name], type=pa.string())

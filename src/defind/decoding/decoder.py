@@ -8,12 +8,12 @@ the universal buffer.
 
 from __future__ import annotations
 
-from typing import Any, Sequence, Optional, Dict
+from typing import Any, Sequence, Dict
 
 from eth_utils import to_checksum_address
 
 from .specs import EventRegistry
-from .utils import word_at, parse_topic_field, parse_data_word, resolve_projection_ref
+from .utils import word_at, parse_topic_field, parse_data_word, resolve_ref
 
 
 # ---------- meta & parsed event ----------
@@ -22,7 +22,7 @@ class Meta:
     """Lightweight metadata for a single log used during decoding."""
     __slots__ = ("block_number", "block_timestamp", "tx_hash", "log_index", "pool")
 
-    def __init__(self, block_number: int, block_timestamp: int, tx_hash: str, log_index: int, pool: str):
+    def __init__(self, block_number: int, block_timestamp: int, tx_hash: str, log_index: int, pool: str) -> None:
         self.block_number = block_number
         self.block_timestamp = block_timestamp
         self.tx_hash = tx_hash
@@ -34,7 +34,7 @@ class ParsedEvent:
     """Decoded event with open-ended `values` for dynamic projections."""
     __slots__ = ("name", "pool", "meta", "values")
 
-    def __init__(self, name: str, pool: str, meta: Meta, values: Dict[str, Any]):
+    def __init__(self, name: str, pool: str, meta: Meta, values: Dict[str, Any]) -> None:
         self.name = name
         self.pool = pool
         self.meta = meta
@@ -43,13 +43,13 @@ class ParsedEvent:
 
 # ---------- main generic decoder (dynamic) ----------
 
-def decode_to_parsed_event(
+def decode_event(
     *,
     topics: Sequence[str],
     data: bytes,
     meta: Meta,
     registry: EventRegistry,
-) -> Optional[ParsedEvent]:
+) -> ParsedEvent | None:
     """Decode raw log (topics + data) into a `ParsedEvent` or return None if filtered.
 
     Filtering rules (optional per `EventSpec`):
@@ -97,7 +97,7 @@ def decode_to_parsed_event(
     # Dynamically resolve ALL projection keys
     resolved: Dict[str, Any] = {}
     for out_key, ref in spec.projection.items():
-        v = resolve_projection_ref(ref, topic_vals, data_vals)
+        v = resolve_ref(ref, topic_vals, data_vals)
         if isinstance(v, int):
             v = str(v)  # Arrow safety for big ints
         resolved[out_key] = v

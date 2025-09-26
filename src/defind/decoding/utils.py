@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from .specs import TopicFieldSpec
 
@@ -22,7 +22,7 @@ def parse_topic_field(topic_hex: str, spec: TopicFieldSpec) -> Any:
         return "0x" + h[-40:]
     if t.startswith("uint") or t.startswith("int"):
         return int(h, 16)
-    # fallback: keep raw hex
+    # Unknown type: return raw hex string
     return h
 
 
@@ -33,17 +33,18 @@ def parse_data_word(word: bytes, typ: str) -> Any:
     if typ.startswith("uint"):
         return int.from_bytes(word, "big", signed=False)
     if typ.startswith("int"):
-        # two's complement
+        # Handle signed integers using two's complement conversion
         v = int.from_bytes(word, "big", signed=False)
         bits = int(typ[3:]) if typ != "int" else 256
+        # Convert to signed if value exceeds positive range
         if v >= 2 ** (bits - 1):
             v -= 2 ** bits
         return v
     return "0x" + word.hex()
 
 
-def resolve_projection_ref(
-    ref: Optional[str],
+def resolve_ref(
+    ref: str | None,
     topic_vals: Dict[str, Any],
     data_vals: Dict[str, Any],
 ) -> Any:
@@ -54,5 +55,5 @@ def resolve_projection_ref(
         return topic_vals.get(ref.split(".", 1)[1])
     if ref.startswith("data."):
         return data_vals.get(ref.split(".", 1)[1])
-    # literal string or raw value
+    # Return literal value (not a reference)
     return ref

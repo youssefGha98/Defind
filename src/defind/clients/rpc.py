@@ -20,6 +20,7 @@ def to_hex_block(x: int) -> str:
     return hex(x)
 
 def topics_param(topic0s: Sequence[str]) -> list[list[str]]:
+    """Format topic0 signatures for eth_getLogs RPC call."""
     return [[t.lower() for t in topic0s]]
 
 class RPC:

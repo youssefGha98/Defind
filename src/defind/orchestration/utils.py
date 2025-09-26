@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 
 def topics_fingerprint(t0s: list[str]) -> str:
@@ -22,7 +22,7 @@ def topics_fingerprint(t0s: list[str]) -> str:
     return "x".join(x[:10] for x in uniq) if uniq else "none"
 
 
-def iter_chunks(a: int, b: int, step: int):
+def iter_chunks(a: int, b: int, step: int) -> list[tuple[int, int]]:
     """Yield inclusive [start, end] block ranges of size at most `step`."""
     x = a
     while x <= b:
@@ -95,7 +95,7 @@ def subtract_iv(iv: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tup
     return res
 
 
-def load_done_coverage(manifests_dir: str, exclude_basename: Optional[str]) -> List[Tuple[int, int]]:
+def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> List[Tuple[int, int]]:
     """Load all `[from_block, to_block]` ranges with status 'done' from manifests.
 
     Parameters

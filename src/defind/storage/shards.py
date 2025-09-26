@@ -1,19 +1,18 @@
-# shards.py
 from __future__ import annotations
 
 import glob
 import os
-from typing import List, Optional
+from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from defind.core.models import UniversalDynColumns
+from defind.core.models import Column
 
 
-class ShardAggregatorUniversal:
+class ShardWriter:
     """
-    Universal shard writer using dynamic columns:
+    Shard writer using dynamic columns:
     any projected key becomes a new column on the fly.
 
     New behavior:
@@ -41,12 +40,11 @@ class ShardAggregatorUniversal:
         self.shards_dir = os.path.join(self.key_dir, "shards")
         os.makedirs(self.shards_dir, exist_ok=True)
 
-        # in-memory buffer for incoming rows
-        self.buf = UniversalDynColumns.empty()
+        self.buf = Column.empty()
 
         # Partial-open shard state (if last shard < rows_per_shard)
-        self._open_partial_idx: Optional[int] = None
-        self._open_partial_tbl: Optional[pa.Table] = None
+        self._open_partial_idx: int | None = None
+        self._open_partial_tbl: pa.Table | None = None
         self._open_partial_remaining: int = 0
 
         # Initialize writer state from existing shards
@@ -71,13 +69,15 @@ class ShardAggregatorUniversal:
         last_rows = pf.metadata.num_rows
 
         if last_rows < self.rows_per_shard and last_rows > 0:
-            # Keep the partial shard "open": read it once so we can rewrite atomically.
+            # Keep partial shard "open" for efficient appending:
+            # Load existing data into memory so we can rewrite atomically
+            # when adding new rows, avoiding expensive file concatenation
             self._open_partial_idx = last_idx
             self._open_partial_tbl = pq.read_table(last_path)
             self._open_partial_remaining = self.rows_per_shard - last_rows
-            return last_idx  # do NOT advance yet; we will when we fill it
+            return last_idx  # Don't advance index until shard is full
         else:
-            # No partial shard to fill; next write will use the next index.
+            # Last shard is full or empty, start with next index
             return last_idx + 1
 
     def _atomic_write(self, out_path: str, table: pa.Table) -> str:
@@ -95,14 +95,13 @@ class ShardAggregatorUniversal:
 
     # ---------- core API ----------
 
-    def add(self, cols: UniversalDynColumns) -> List[str]:
+    def add(self, cols: Column) -> List[str]:
         """Merge `cols` into the aggregator; write shards as they become full.
 
         Returns a list of shard paths that were written/rewritten.
         """
         written: List[str] = []
 
-        # Extend in-memory buffer
         appended = self.buf.extend(cols)
         if appended == 0:
             return written
@@ -144,7 +143,7 @@ class ShardAggregatorUniversal:
         # 3) Leave any remaining (< rows_per_shard) rows in memory buffer
         return written
 
-    def close(self) -> Optional[str]:
+    def close(self) -> str | None:
         """Flush remaining rows.
 
         Rules:
@@ -160,7 +159,7 @@ class ShardAggregatorUniversal:
             return None
 
         # If we still have a partial shard open, try topping it up one last time.
-        last_path: Optional[str] = None
+        last_path: str | None = None
         if self._open_partial_idx is not None and self._open_partial_remaining > 0 and size > 0:
             take_n = min(self._open_partial_remaining, size)
             slice_cols = self.buf.take_first(take_n)
@@ -184,8 +183,8 @@ class ShardAggregatorUniversal:
             return last_path
 
         if not self.write_final_partial and remaining < self.rows_per_shard:
-            # drop trailing in-memory rows (no file created)
-            self.buf = UniversalDynColumns.empty()
+            # Drop incomplete rows when write_final_partial=False
+            self.buf = Column.empty()
             return last_path
 
         slice_cols = self.buf.take_first(remaining)

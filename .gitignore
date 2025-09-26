@@ -12,8 +12,10 @@ wheels/
 # data directories
 data/
 data2/
+vfat/
 src/defind/data/
 src/defind/data2/
+src/defind/vfat/
 *.parquet
 *.jsonl
 

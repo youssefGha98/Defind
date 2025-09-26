@@ -152,9 +152,9 @@ def make_gauge_registry() -> EventRegistry:
         ],
         data_fields=[],
         projection={
-            "owner": "topic.user",                 # adapter maps owner→GaugeRow.user
-            "liquidity": "topic.liquidityToStake", # adapter maps liquidity→GaugeRow.amount
-            "token_id": "topic.tokenId",           # adapter maps to GaugeRow.token_id
+            "owner": "topic.user",
+            "liquidity": "topic.liquidityToStake",
+            "token_id": "topic.tokenId",
         },
         fast_zero_words=(),
         drop_if_all_zero_fields=(),

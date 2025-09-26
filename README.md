@@ -47,21 +47,19 @@ pip install -e .
 ### Basic Usage
 
 ```python
-from defind.orchestration.orchestrator import fetch_decode_streaming_universal
+from defind.orchestration.orchestrator import fetch_decode
 from defind.decoding.registries import make_clpool_registry
-from defind.clients.rpc import RPC
 
 # Setup
-rpc = RPC("https://your-ethereum-rpc-url")
 registry = make_clpool_registry()
 
 # Fetch and decode data
-result = await fetch_decode_streaming_universal(
-    rpc=rpc,
+result = await fetch_decode(
+    rpc_url="https://your-ethereum-rpc-url",
     address="0x...",  # Contract address
     topic0s=["0x..."],  # Event signatures
-    from_block=18000000,
-    to_block=18001000,
+    start_block=18000000,
+    end_block=18001000,
     registry=registry,
     out_root="./data",
     # ... other parameters
@@ -129,7 +127,7 @@ custom_spec = EventSpec(
 
 ```python
 # High-throughput configuration
-result = await fetch_decode_streaming_universal(
+result = await fetch_decode(
     # ... other params
     rows_per_shard=500_000,     # Larger shards
     batch_decode_rows=100_000,  # Larger batches
