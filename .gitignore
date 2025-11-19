@@ -22,3 +22,7 @@ src/defind/vfat/
 # notebooks and test files
 test.ipynb
 *.ipynb
+
+# Allow notebooks in specific directories
+!notebooks/*.ipynb
+!examples/*.ipynb

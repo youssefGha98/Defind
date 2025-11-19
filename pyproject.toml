@@ -16,6 +16,7 @@ dependencies = [
     "eth-utils>=5.3.1",
     "eth-hash[pycryptodome]>=0.7.1",
     "duckdb>=1.4.0",
+    "web3>=7.13.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"
@@ -26,13 +27,16 @@ build-backend = "hatchling.build"
 
 [tool.rye]
 managed = true
+workspace = true
 dev-dependencies = []
+
+
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/defind"]
+packages = ["src/defind", "src/define"]
 
 [project.scripts]
 defind = "defind.cli:cli"

@@ -92,6 +92,7 @@ def decode_event(
     # Drop if all specified fields are zero (post-parse)
     if spec.drop_if_all_zero_fields:
         if all(int(data_vals.get(name, 0) or 0) == 0 for name in spec.drop_if_all_zero_fields):
+            print("aaaaaa")
             return None
 
     # Dynamically resolve ALL projection keys
@@ -106,5 +107,5 @@ def decode_event(
         name=spec.name,
         pool=to_checksum_address(meta.pool),
         meta=meta,
-        values=resolved,           # <- open-ended dict
+        values=resolved,           
     )
