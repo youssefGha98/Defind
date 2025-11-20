@@ -13,17 +13,23 @@ Projection values accept:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 # ---- Dynamic projection mapping ----
 # Any projection key is allowed; values are "topic.foo" | "data.bar" | literal
+# Keys: output column names (e.g., "amount0", "owner", "liquidity")
+# Values: references to parsed fields or literal strings
+#   - "topic.<name>" → value from indexed topic field
+#   - "data.<name>" → value from data word field
+#   - any other string → treated as a literal value
 Projection = Mapping[str, str]
 
 
 @dataclass(frozen=True)
 class TopicFieldSpec:
     """Describe one indexed topic field (by 0-based topic index and ABI type)."""
+
     name: str
     index: int
     type: str  # e.g., "address", "uint256", "int24", "bytes32"
@@ -32,6 +38,7 @@ class TopicFieldSpec:
 @dataclass(frozen=True)
 class DataFieldSpec:
     """Describe one 32-byte ABI word in the data section (0-based word index)."""
+
     name: str
     word_index: int
     type: str  # e.g., "address", "uint256", "uint128"
@@ -40,6 +47,7 @@ class DataFieldSpec:
 @dataclass(frozen=True)
 class EventSpec:
     """One event decoding rule + dynamic projection."""
+
     topic0: str
     name: str
     topic_fields: list[TopicFieldSpec]

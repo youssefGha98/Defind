@@ -16,10 +16,10 @@ Design notes
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+import json
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-import json
 import pyarrow as pa
 
 # === Base schema (Arrow) ===
@@ -38,33 +38,48 @@ Status = Literal["started", "done", "failed"]
 
 # === RPC record ===
 
+
 @dataclass(slots=True, frozen=True)
 class EventLog:
     """Raw log as fetched from RPC, minimally normalized."""
-    address: str                    # lowercased 0x...
-    topics: tuple[str, ...]         # lowercased 0x...
-    data_hex: str                   # "0x..."
+
+    address: str  # lowercased 0x...
+    topics: tuple[str, ...]  # lowercased 0x...
+    data_hex: str  # "0x..."
     block_number: int
-    tx_hash: str                    # lowercased 0x...
+    tx_hash: str  # lowercased 0x...
     log_index: int
     block_timestamp: int | None = None
 
 
+@dataclass(slots=True)
+class Meta:
+    """Lightweight metadata for a single log used during decoding."""
+
+    block_number: int
+    block_timestamp: int | None
+    tx_hash: str
+    log_index: int
+    pool: str
+
+
 # === Manifest record ===
+
 
 @dataclass(slots=True)
 class ChunkRecord:
     """A single chunk execution record persisted to the live manifest."""
+
     from_block: int
     to_block: int
     status: Status
     attempts: int
     error: str | None
-    logs: int              # raw logs fetched
-    decoded: int           # kept rows
-    shards: int            # shard files written due to this chunk
+    logs: int  # raw logs fetched
+    decoded: int  # kept rows
+    shards: int  # shard files written due to this chunk
     updated_at: float
-    filtered: int = 0      # rows skipped by fast filter
+    filtered: int = 0  # rows skipped by fast filter
 
     def to_json_line(self) -> str:
         """Serialize as a compact JSON line."""
@@ -72,6 +87,7 @@ class ChunkRecord:
 
 
 # === Dynamic column buffer ===
+
 
 @dataclass(slots=True)
 class Column:
@@ -82,6 +98,7 @@ class Column:
     - All dynamic values are stored as *strings* (or None) to avoid Arrow
       overflow and preserve exactness (e.g., uint256).
     """
+
     block_number: list[int] = field(default_factory=list)
     block_timestamp: list[int] = field(default_factory=list)
     tx_hash: list[str] = field(default_factory=list)
@@ -102,23 +119,14 @@ class Column:
         """Number of rows currently stored."""
         return self._rows
 
-    def _append_base(
-        self,
-        *,
-        block_number: int,
-        block_timestamp: int,
-        tx_hash: str,
-        log_index: int,
-        contract: str,
-        event: str,
-    ) -> None:
+    def _append_base(self, meta: Meta, contract: str, event: str) -> None:
         """Append one row to base columns and pad existing dynamic cols."""
-        self.block_number.append(int(block_number))
-        self.block_timestamp.append(int(block_timestamp or 0))
-        self.tx_hash.append(str(tx_hash))
-        self.log_index.append(int(log_index))
-        self.contract.append(str(contract))
-        self.event.append(str(event))
+        self.block_number.append(meta.block_number)
+        self.block_timestamp.append(int(meta.block_timestamp or 0))
+        self.tx_hash.append(meta.tx_hash)
+        self.log_index.append(meta.log_index)
+        self.contract.append(contract)
+        self.event.append(event)
         self._rows += 1
         # Pad existing dynamic columns with None for the new row
         for col in self.dyn.values():
@@ -136,19 +144,12 @@ class Column:
         self,
         *,
         pe_name: str,
-        meta,
+        meta: Meta,
         values: dict[str, Any],
         contract_addr: str,
     ) -> None:
         """Append a decoded event into the buffer (all keys become columns)."""
-        self._append_base(
-            block_number=meta.block_number,
-            block_timestamp=meta.block_timestamp or 0,
-            tx_hash=meta.tx_hash,
-            log_index=meta.log_index,
-            contract=contract_addr,
-            event=pe_name,
-        )
+        self._append_base(meta, contract_addr, pe_name)
         # Convert all projection values to strings for Arrow compatibility
         for k, v in values.items():
             sval: str | None = None if v is None else str(v)

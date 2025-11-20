@@ -1,28 +1,85 @@
-# python generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
 wheels/
-*.egg-info
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# venv
-.venv
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
 
-# data directories
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Documentation
+docs/_build/
+site/
+
+# Project-specific data directories
 data/
 data2/
 vfat/
 src/defind/data/
 src/defind/data2/
 src/defind/vfat/
+
+# Output files
 *.parquet
 *.jsonl
+*.log
 
-# notebooks and test files
-test.ipynb
+# Notebooks
 *.ipynb
+.ipynb_checkpoints/
 
-# Allow notebooks in specific directories
-!notebooks/*.ipynb
-!examples/*.ipynb
+# Ruff
+.ruff_cache/
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from .decoding.specs import EventSpec, TopicFieldSpec, DataFieldSpec, EventRegistry
-from .core.constants import MINT_T0, BURN_T0, COLLECT_T0, COLLECTFEES_T0, POOL_CREATED_T0, GAUGE_CREATED_T0
+from .core.constants import BURN_T0, COLLECT_T0, COLLECTFEES_T0, MINT_T0
 from .core.models import Column
+from .decoding.registry import add_event_spec, add_many, make_registry
+from .decoding.specs import DataFieldSpec, EventRegistry, EventSpec, TopicFieldSpec
 
 __all__ = [
-    "EventSpec", "TopicFieldSpec", "DataFieldSpec", "EventRegistry",
-    "MINT_T0", "BURN_T0", "COLLECT_T0", "COLLECTFEES_T0", "POOL_CREATED_T0", "GAUGE_CREATED_T0",
+    "make_registry",
+    "add_event_spec",
+    "add_many",
+    "EventSpec",
+    "TopicFieldSpec",
+    "DataFieldSpec",
+    "EventRegistry",
+    "MINT_T0",
+    "BURN_T0",
+    "COLLECT_T0",
+    "COLLECTFEES_T0",
     "Column",
 ]

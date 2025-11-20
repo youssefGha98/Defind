@@ -18,29 +18,38 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
 
 from defind.clients.rpc import RPC
-from defind.decoding.decoder import Meta, decode_event
+from defind.core.config import OrchestratorConfig
+from defind.core.models import ChunkRecord, Column, EventLog, Meta
+from defind.decoding.decoder import decode_event
 from defind.decoding.specs import EventRegistry
-from defind.storage.manifest import LiveManifest
-from defind.storage.shards import ShardWriter
 from defind.orchestration.utils import (
     iter_chunks,
     load_done_coverage,
     subtract_iv,
     topics_fingerprint,
 )
-from defind.core.models import ChunkRecord, Column
+from defind.storage.manifest import LiveManifest
+from defind.storage.shards import ShardWriter
 
+# -------------------------
+# Constants
+# -------------------------
+
+# RPC connection pool sizing: ensure enough connections for concurrent workers
+# Formula: max(minimum_safe_value, 2 * concurrency) to handle request bursts
+MIN_RPC_CONNECTIONS = 32
 
 # -------------------------
 # Context & worker
 # -------------------------
 
+
 @dataclass(slots=True)
 class ProcessContext:
     """Shared state for interval processing (keeps worker signature small)."""
+
     rpc: RPC
     address: str
     topic0s: list[str]
@@ -54,12 +63,57 @@ class ProcessContext:
     stats: dict[str, int]
 
 
+async def _process_logs(ctx: ProcessContext, logs: list[EventLog]) -> tuple[int, int, int]:
+    """Decode logs and write to aggregator, returning (decoded, filtered, shards_written)."""
+    buf = Column.empty()
+    rows_in_batch = 0
+    decoded_rows = 0
+    filtered_rows = 0
+    shards_written = 0
+
+    for ev in logs:
+        if not ev.topics:
+            filtered_rows += 1
+            continue
+
+        # Decode raw hex data payload
+        data_hex = ev.data_hex[2:] if ev.data_hex.lower().startswith("0x") else ev.data_hex
+        data_bytes = bytes.fromhex(data_hex) if data_hex else b""
+
+        meta = Meta(ev.block_number, ev.block_timestamp, ev.tx_hash, ev.log_index, ev.address)
+
+        pe = decode_event(topics=ev.topics, data=data_bytes, meta=meta, registry=ctx.registry)
+        if pe is None:
+            filtered_rows += 1
+            continue
+
+        # Append all dynamic keys in one go
+        buf.append_from_parsed(pe_name=pe.name, meta=meta, values=pe.values, contract_addr=pe.pool)
+        rows_in_batch += 1
+        decoded_rows += 1
+
+        if rows_in_batch >= ctx.batch_decode_rows:
+            async with ctx.agg_lock:
+                written = ctx.aggregator.add(buf)
+            shards_written += len(written)
+            buf = Column.empty()
+            rows_in_batch = 0
+
+    # Flush last partial batch for this interval
+    if rows_in_batch > 0:
+        async with ctx.agg_lock:
+            written = ctx.aggregator.add(buf)
+        shards_written += len(written)
+
+    return decoded_rows, filtered_rows, shards_written
+
+
 async def process_interval(ctx: ProcessContext, start_block: int, end_block: int) -> None:
     """Process one inclusive [start_block, end_block] range with retry splitting."""
     stack: list[tuple[int, int]] = [(start_block, end_block)]
     while stack:
         a, b = stack.pop()
-        await ctx.manifest.append(ChunkRecord(a, b, "started", 0, None, 0, 0, 0, time.time(), 0))
+        await ctx.manifest.append(_create_started_record(a, b))
         try:
             async with ctx.sem:
                 logs = await ctx.rpc.get_logs(address=ctx.address, topic0s=ctx.topic0s, from_block=a, to_block=b)
@@ -67,57 +121,11 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
             ctx.stats["executed_subranges"] += 1
             ctx.stats["total_logs"] += len(logs)
 
-            buf = Column.empty()
-            rows_in_batch = 0
-            decoded_rows = 0
-            filtered_rows = 0
-            shards_here = 0
-
-            for i, ev in enumerate(logs):
-         
-                if not ev.topics:
-                    filtered_rows += 1
-                    continue
-
-                # Decode raw hex data payload
-                data_hex = ev.data_hex[2:] if ev.data_hex.lower().startswith("0x") else ev.data_hex
-                data_bytes = bytes.fromhex(data_hex) if data_hex else b""
-
-                meta = Meta(ev.block_number, ev.block_timestamp, ev.tx_hash, ev.log_index, ev.address)
-
-                pe = decode_event(topics=ev.topics, data=data_bytes, meta=meta, registry=ctx.registry)
-                
-                if pe is None:
-                    filtered_rows += 1
-                    continue
-
-                # Append all dynamic keys in one go
-                buf.append_from_parsed(pe_name=pe.name, meta=meta, values=pe.values, contract_addr=pe.pool)
-                rows_in_batch += 1
-                decoded_rows += 1
-
-                if rows_in_batch >= ctx.batch_decode_rows:
-                    async with ctx.agg_lock:
-                        written_by_event = ctx.aggregator.add(buf)
-                    # Count total shards across all events
-                    for paths in written_by_event.values():
-                        shards_here += len(paths)
-                    buf = Column.empty()
-                    rows_in_batch = 0
-
-            # Flush last partial batch for this interval
-            if rows_in_batch > 0:
-                async with ctx.agg_lock:
-                    written_by_event = ctx.aggregator.add(buf)
-                # Count total shards across all events
-                for paths in written_by_event.values():
-                    shards_here += len(paths)
+            decoded_rows, filtered_rows, shards_here = await _process_logs(ctx, logs)
 
             ctx.stats["processed_ok"] += 1
             ctx.stats["shards_written"] += shards_here
-            await ctx.manifest.append(
-                ChunkRecord(a, b, "done", 1, None, len(logs), decoded_rows, shards_here, time.time(), filtered_rows)
-            )
+            await ctx.manifest.append(_create_done_record(a, b, len(logs), decoded_rows, shards_here, filtered_rows))
 
         except Exception as e:
             span = b - a + 1
@@ -125,75 +133,95 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
                 mid = (a + b) // 2
                 stack.extend([(a, mid), (mid + 1, b)])
                 ctx.stats["partially_covered_split"] += 1
-                await ctx.manifest.append(ChunkRecord(a, b, "failed", 1, str(e), 0, 0, 0, time.time(), 0))
+                await ctx.manifest.append(_create_failed_record(a, b, str(e)))
             else:
                 ctx.stats["processed_failed"] += 1
-                await ctx.manifest.append(ChunkRecord(a, b, "failed", 1, str(e), 0, 0, 0, time.time(), 0))
+                await ctx.manifest.append(_create_failed_record(a, b, str(e)))
+
+
+# -------------------------
+# Helper factories
+# -------------------------
+
+
+def _init_stats() -> dict[str, int]:
+    """Initialize stats dictionary with default counters."""
+    return {
+        "processed_ok": 0,
+        "processed_failed": 0,
+        "executed_subranges": 0,
+        "total_logs": 0,
+        "partially_covered_split": 0,
+        "shards_written": 0,
+    }
+
+
+def _create_started_record(a: int, b: int) -> ChunkRecord:
+    """Create a 'started' chunk record."""
+    return ChunkRecord(a, b, "started", 0, None, 0, 0, 0, time.time(), 0)
+
+
+def _create_done_record(a: int, b: int, logs: int, decoded: int, shards: int, filtered: int) -> ChunkRecord:
+    """Create a 'done' chunk record."""
+    return ChunkRecord(a, b, "done", 1, None, logs, decoded, shards, time.time(), filtered)
+
+
+def _create_failed_record(a: int, b: int, error: str) -> ChunkRecord:
+    """Create a 'failed' chunk record."""
+    return ChunkRecord(a, b, "failed", 1, error, 0, 0, 0, time.time(), 0)
 
 
 # -------------------------
 # Orchestrator
 # -------------------------
 
-def _setup_directories(out_root: str) -> str:
+
+def _setup_directories(out_root: str, address: str, topic0s: list[str]) -> tuple[str, str]:
     """Setup output directories for the fetch operation.
-    
+
     Returns:
-        Root directory path for manifests
+        Tuple of (key_dir, manifests_dir)
     """
-    manifests_dir = os.path.join(out_root, "_manifests")
+    address_lc = address.lower()
+    topics_fp = topics_fingerprint(topic0s)
+    key_dir = os.path.join(out_root, f"{address_lc}__topics-{topics_fp}__universal")
+    manifests_dir = os.path.join(key_dir, "manifests")
     os.makedirs(manifests_dir, exist_ok=True)
-    return manifests_dir
+    return key_dir, manifests_dir
 
 
 async def _resolve_block_range(rpc: RPC, start_block: int | str, end_block: int | str) -> tuple[int, int]:
     """Resolve start and end blocks, handling special values like 'latest'.
-    
+
     Returns:
         Tuple of (start, end) as integers
     """
     start = 0 if (isinstance(start_block, str) and start_block.lower() in ("earliest", "genesis")) else int(start_block)
     end = await rpc.latest_block() if (isinstance(end_block, str) and end_block.lower() == "latest") else int(end_block)
-    
+
     if start > end:
         raise ValueError("start_block must be <= end_block")
-    
+
     return start, end
 
 
 def _build_work_seeds(start: int, end: int, step: int, covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Build list of uncovered block ranges to process.
-    
+
     Returns:
         List of (start_block, end_block) tuples to process
     """
     seeds: list[tuple[int, int]] = []
-    uncovered_ranges = list(subtract_iv((start, end), covered))
-    
-    for uncovered_start, uncovered_end in uncovered_ranges:
-        chunks = list(iter_chunks(uncovered_start, uncovered_end, step))
-        for a, b in chunks:
+    for uncovered_start, uncovered_end in subtract_iv((start, end), covered):
+        for a, b in iter_chunks(uncovered_start, uncovered_end, step):
             seeds.append((a, b))
-    
     return seeds
 
 
 async def fetch_decode(
     *,
-    rpc_url: str,
-    address: str,
-    topic0s: list[str],
-    start_block: int | str,
-    end_block: int | str,
-    step: int = 5_000,
-    concurrency: int = 16,
-    out_root: str = "./data",
-    rows_per_shard: int = 250_000,
-    batch_decode_rows: int = 10_000,
-    timeout_s: int = 20,
-    min_split_span: int = 2_000,
-    write_final_partial: bool = True,
-    registry: EventRegistry | None = None,
+    config: OrchestratorConfig,
+    registry: EventRegistry,
 ) -> dict[str, int]:
     """Stream logs from RPC, decode with registry, and write Parquet shards.
 
@@ -202,65 +230,50 @@ async def fetch_decode(
     dict[str, int]
         Summary counters for the run.
     """
-    if not registry:
-        raise ValueError("Registry is empty. Compose a registry (e.g., CL pool + Gauge) and pass it explicitly.")
-
     # Setup directories and RPC client
-    manifests_dir = _setup_directories(out_root)
-    rpc = RPC(rpc_url, timeout_s=timeout_s, max_connections=max(32, concurrency))
-    
+    key_dir, manifests_dir = _setup_directories(config.out_root, config.address, config.topic0s)
+    rpc = RPC(
+        config.rpc_url, timeout_s=config.timeout_s, max_connections=max(MIN_RPC_CONNECTIONS, 2 * config.concurrency)
+    )
+
     try:
         # Resolve block range
-        start, end = await _resolve_block_range(rpc, start_block, end_block)
-        
+        start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
+
         # Setup manifest and coverage
-        address_lc = address.lower()
-        topics_fp = topics_fingerprint(topic0s)
-        run_basename = f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_{address_lc}_{topics_fp}_{start}_{end}.jsonl"
+        address_lc = config.address.lower()
+        topics_fp = topics_fingerprint(config.topic0s)
+        run_basename = (
+            f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_{address_lc}_{topics_fp}_{start}_{end}.jsonl"
+        )
         manifest = LiveManifest(os.path.join(manifests_dir, run_basename))
-        
         covered = load_done_coverage(manifests_dir, exclude_basename=run_basename)
-        
+
         # Build work list
-        seeds = _build_work_seeds(start, end, step, covered)
-
-
+        seeds = _build_work_seeds(start, end, config.step, covered)
 
         if not seeds:
-            return {
-                "processed_ok": 0,
-                "processed_failed": 0,
-                "executed_subranges": 0,
-                "total_logs": 0,
-                "partially_covered_split": 0,
-                "shards_written": 0,
-            }
+            return _init_stats()
+
         aggregator = ShardWriter(
-            out_root,
+            config.out_root,
             address_lc,
             topics_fp,
-            rows_per_shard=rows_per_shard,
-            write_final_partial=write_final_partial,
+            rows_per_shard=config.rows_per_shard,
+            write_final_partial=config.write_final_partial,
         )
         agg_lock = asyncio.Lock()
-        sem = asyncio.Semaphore(concurrency)
+        sem = asyncio.Semaphore(config.concurrency)
 
-        stats: dict[str, int] = {
-            "processed_ok": 0,
-            "processed_failed": 0,
-            "executed_subranges": 0,
-            "total_logs": 0,
-            "partially_covered_split": 0,
-            "shards_written": 0,
-        }
+        stats = _init_stats()
 
         ctx = ProcessContext(
             rpc=rpc,
-            address=address,
-            topic0s=topic0s,
+            address=config.address,
+            topic0s=config.topic0s,
             registry=registry,
-            batch_decode_rows=batch_decode_rows,
-            min_split_span=min_split_span,
+            batch_decode_rows=config.batch_decode_rows,
+            min_split_span=config.min_split_span,
             sem=sem,
             agg_lock=agg_lock,
             manifest=manifest,
@@ -271,13 +284,13 @@ async def fetch_decode(
         # Dispatch workers
         tasks = [asyncio.create_task(process_interval(ctx, a, b)) for a, b in seeds]
         await asyncio.gather(*tasks)
-        # Close aggregator and possibly write trailing partial shards
+
+        # Close aggregator and possibly write trailing partial shard
         async with agg_lock:
-            last_by_event = aggregator.close()
-        # Count final shards written
-        for last_path in last_by_event.values():
-            if last_path:
-                stats["shards_written"] += 1
+            last = aggregator.close()
+        if last:
+            stats["shards_written"] += 1
+
         return stats
     finally:
         await rpc.aclose()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 from .specs import TopicFieldSpec
 
@@ -38,15 +38,15 @@ def parse_data_word(word: bytes, typ: str) -> Any:
         bits = int(typ[3:]) if typ != "int" else 256
         # Convert to signed if value exceeds positive range
         if v >= 2 ** (bits - 1):
-            v -= 2 ** bits
+            v -= 2**bits
         return v
     return "0x" + word.hex()
 
 
 def resolve_ref(
     ref: str | None,
-    topic_vals: Dict[str, Any],
-    data_vals: Dict[str, Any],
+    topic_vals: dict[str, Any],
+    data_vals: dict[str, Any],
 ) -> Any:
     """Resolve a projection reference like 'topic.foo', 'data.bar', or a literal."""
     if ref is None:

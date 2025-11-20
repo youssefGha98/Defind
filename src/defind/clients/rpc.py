@@ -9,8 +9,8 @@ It returns `EventLog` records ready for downstream decoding.
 
 from __future__ import annotations
 
-import asyncio
-from typing import Sequence
+from collections.abc import Sequence
+
 import httpx
 
 from defind.core.models import EventLog
@@ -20,9 +20,11 @@ def to_hex_block(x: int) -> str:
     """Return a 0x-prefixed hex block number."""
     return hex(x)
 
+
 def topics_param(topic0s: Sequence[str]) -> list[list[str]]:
     """Format topic0 signatures for eth_getLogs RPC call."""
     return [[t.lower() for t in topic0s]]
+
 
 class RPC:
     """Minimal async RPC client.
@@ -39,8 +41,6 @@ class RPC:
 
     def __init__(self, url: str, *, timeout_s: int = 20, max_connections: int = 64) -> None:
         self.url = url
-        self._max_retries = 5  # Default retry count
-        self._base_delay = 1.0  # Default base delay
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=timeout_s,
@@ -55,110 +55,12 @@ class RPC:
             http2=True,
         )
 
-    async def _make_request_with_retry(self, payload: dict) -> dict:
-        """Make RPC request with retry + provider-specified backoff for 429."""
-        for attempt in range(self._max_retries + 1):
-            try:
-                r = await self.client.post(self.url, json=payload)
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
-                # Network issues: exponential backoff
-                if attempt == self._max_retries:
-                    raise
-
-                delay = self._base_delay * (2 ** attempt)
-                print(
-                    f"⚠️  Connection error {e!r}, retrying in {delay}s... "
-                    f"(attempt {attempt + 1}/{self._max_retries + 1})"
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # We got an HTTP response here
-            # Try to parse JSON (JSON-RPC)
-            try:
-                data = r.json()
-            except ValueError:
-                # Not JSON? Just raise if it's an error, otherwise return raw text
-                try:
-                    r.raise_for_status()
-                except httpx.HTTPStatusError:
-                    if attempt == self._max_retries:
-                        raise
-                    delay = self._base_delay * (2 ** attempt)
-                    print(
-                        f"⚠️  HTTP error {r.status_code}, retrying in {delay}s... "
-                        f"(attempt {attempt + 1}/{self._max_retries + 1})"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                return r.text
-
-            # Check for JSON-RPC error block
-            rpc_error = data.get("error")
-
-            # Detect rate limiting:
-            #  - HTTP 429, OR
-            #  - JSON-RPC error.code == 429 (some providers use HTTP 200 + JSON error)
-            is_rate_limited = (
-                r.status_code == 429
-                or (rpc_error is not None and rpc_error.get("code") == 429)
-            )
-
-            if is_rate_limited:
-                if attempt == self._max_retries:
-                    raise RuntimeError(f"Rate limited and max retries exceeded: {data}")
-
-                # Try to respect provider's backoff_seconds
-                backoff = 5.0
-                if rpc_error:
-                    rpc_data = rpc_error.get("data", {})
-                    try:
-                        backoff = float(rpc_data.get("backoff_seconds", backoff))
-                    except (TypeError, ValueError):
-                        pass
-
-                # Optional: enforce a minimum to avoid hammering anyway
-                backoff = max(backoff, 30.0)
-
-                print(
-                    f"⚠️  Rate limited (429), retrying in {backoff}s... "
-                    f"(attempt {attempt + 1}/{self._max_retries + 1})"
-                )
-                await asyncio.sleep(backoff)
-                continue
-
-            # Handle other HTTP errors
-            try:
-                r.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                if attempt == self._max_retries:
-                    raise
-
-                delay = self._base_delay * (2 ** attempt)
-                print(
-                    f"⚠️  HTTP error {e.response.status_code}, retrying in {delay}s... "
-                    f"(attempt {attempt + 1}/{self._max_retries + 1})"
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # If we reach this point, HTTP is OK.
-            # But JSON-RPC could still have *non-429* errors: up to you how to handle.
-            if rpc_error:
-                # Personally I'd raise to notice it:
-                raise RuntimeError(f"JSON-RPC error: {rpc_error}")
-
-            return data
-
-        # Should be unreachable
-        raise RuntimeError(f"Max retries ({self._max_retries}) exceeded")
-
-
     async def latest_block(self) -> int:
         """Return the latest block number as an int."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
-        data = await self._make_request_with_retry(payload)
-        return int(data["result"], 16)
+        r = await self.client.post(self.url, json=payload)
+        r.raise_for_status()
+        return int(r.json()["result"], 16)
 
     async def get_logs(
         self,
@@ -177,19 +79,19 @@ class RPC:
                 "topics": topics_param(topic0s),
             }
         ]
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params}
-        data = await self._make_request_with_retry(payload)
-        
+        r = await self.client.post(
+            self.url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params},
+        )
+        r.raise_for_status()
+        data = r.json()
         if "error" in data:
             e = data["error"]
             raise RuntimeError(f"RPC error: {e.get('code')} {e.get('message')}")
 
         out: list[EventLog] = []
         for rl in data.get("result", []):
-            topics = tuple(
-                (t if isinstance(t, str) else t.decode()).lower()
-                for t in rl.get("topics", [])
-            )
+            topics = tuple((t if isinstance(t, str) else t.decode()).lower() for t in rl.get("topics", []))
             ts = rl.get("blockTimestamp")
             ts_i = (
                 int(ts, 16)

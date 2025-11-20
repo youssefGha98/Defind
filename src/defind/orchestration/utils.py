@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Tuple
+from collections.abc import Generator
 
 
 def topics_fingerprint(t0s: list[str]) -> str:
@@ -22,7 +22,7 @@ def topics_fingerprint(t0s: list[str]) -> str:
     return "x".join(x[:10] for x in uniq) if uniq else "none"
 
 
-def iter_chunks(a: int, b: int, step: int) -> list[tuple[int, int]]:
+def iter_chunks(a: int, b: int, step: int) -> Generator[tuple[int, int], None, None]:
     """Yield inclusive [start, end] block ranges of size at most `step`."""
     x = a
     while x <= b:
@@ -31,8 +31,7 @@ def iter_chunks(a: int, b: int, step: int) -> list[tuple[int, int]]:
         x = y + 1
 
 
-
-def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge overlapping/adjacent inclusive intervals.
 
     Parameters
@@ -48,7 +47,7 @@ def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not intervals:
         return []
     intervals_sorted = sorted(intervals)
-    out: List[List[int]] = [[intervals_sorted[0][0], intervals_sorted[0][1]]]
+    out: list[list[int]] = [[intervals_sorted[0][0], intervals_sorted[0][1]]]
     for s, e in intervals_sorted[1:]:
         ms, me = out[-1]
         if s <= me + 1:
@@ -58,7 +57,7 @@ def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(s, e) for s, e in out]
 
 
-def subtract_iv(iv: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def subtract_iv(iv: tuple[int, int], covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Subtract covered inclusive intervals from a target inclusive interval.
 
     Parameters
@@ -78,7 +77,7 @@ def subtract_iv(iv: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tup
         return []
     if not covered:
         return [iv]
-    res: List[Tuple[int, int]] = []
+    res: list[tuple[int, int]] = []
     cur = s
     for cs, ce in covered:
         if ce < cur:
@@ -95,7 +94,7 @@ def subtract_iv(iv: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tup
     return res
 
 
-def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> List[Tuple[int, int]]:
+def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> list[tuple[int, int]]:
     """Load all `[from_block, to_block]` ranges with status 'done' from manifests.
 
     Parameters
@@ -110,7 +109,7 @@ def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> List
     list[tuple[int, int]]
         Merged 'done' intervals across all manifests.
     """
-    intervals: List[Tuple[int, int]] = []
+    intervals: list[tuple[int, int]] = []
     if not os.path.isdir(manifests_dir):
         return []
     for name in os.listdir(manifests_dir):
@@ -120,7 +119,7 @@ def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> List
             continue
         path = os.path.join(manifests_dir, name)
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -131,3 +130,18 @@ def load_done_coverage(manifests_dir: str, exclude_basename: str | None) -> List
             # Ignore corrupt/incomplete files; resumability tolerates this.
             continue
     return merge_intervals(intervals)
+
+
+def to_hex_block(block: int | str) -> str:
+    """Convert block number to hex string if integer, else return as is."""
+    if isinstance(block, int):
+        return hex(block)
+    return block
+
+
+def normalize_topic0_list(topic0s: list[str]) -> list[str | None]:
+    """Normalize topic0 list for RPC (None for wildcard, else hex strings)."""
+    # If list is empty, it means ANY topic (wildcard) -> return [None] or [] depending on RPC?
+    # Usually ["0x..."] or [null] for wildcard.
+    # But here we probably want specific topics.
+    return [t.lower() for t in topic0s if t]

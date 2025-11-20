@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -93,43 +92,62 @@ class ShardWriter:
     def _shard_path(self, idx: int) -> str:
         return os.path.join(self.shards_dir, f"shard_{idx:05d}.parquet")
 
+    @property
+    def _has_open_partial(self) -> bool:
+        """Check if there's an open partial shard ready to be topped up."""
+        return self._open_partial_idx is not None and self._open_partial_remaining > 0
+
+    def _top_up_partial_shard(self, rows_to_take: int) -> str | None:
+        """Top up the currently open partial shard with rows from buffer.
+
+        Args:
+            rows_to_take: Maximum number of rows to take from buffer
+
+        Returns:
+            Path of the written shard file, or None if nothing written
+        """
+        if not self._has_open_partial or rows_to_take == 0:
+            return None
+
+        take_n = min(self._open_partial_remaining, rows_to_take)
+        slice_cols = self.buf.take_first(take_n)
+        new_tbl = slice_cols.to_arrow_table()
+
+        assert self._open_partial_tbl is not None
+        assert self._open_partial_idx is not None
+        updated_tbl = pa.concat_tables([self._open_partial_tbl, new_tbl], promote=True)
+
+        out_path = self._atomic_write(self._shard_path(self._open_partial_idx), updated_tbl)
+
+        self._open_partial_remaining -= take_n
+        self._open_partial_tbl = updated_tbl if self._open_partial_remaining > 0 else None
+
+        # If shard is now full, advance index and clear partial state
+        if self._open_partial_remaining == 0:
+            self.shard_idx = (self._open_partial_idx or 0) + 1
+            self._open_partial_idx = None
+            self._open_partial_tbl = None
+
+        return out_path
+
     # ---------- core API ----------
 
-    def add(self, cols: Column) -> List[str]:
+    def add(self, cols: Column) -> list[str]:
         """Merge `cols` into the aggregator; write shards as they become full.
 
         Returns a list of shard paths that were written/rewritten.
         """
-        written: List[str] = []
+        written: list[str] = []
 
         appended = self.buf.extend(cols)
         if appended == 0:
             return written
 
         # 1) If we have a partial last shard open, top it up first
-        if self._open_partial_idx is not None and self._open_partial_remaining > 0:
-            if self.buf.size() > 0:
-                take_n = min(self._open_partial_remaining, self.buf.size())
-                slice_cols = self.buf.take_first(take_n)
-                new_tbl = slice_cols.to_arrow_table()
-
-                # Concatenate with existing shard (promote schema if needed)
-                assert self._open_partial_tbl is not None
-                updated_tbl = pa.concat_tables([self._open_partial_tbl, new_tbl], promote=True)
-
-                # Rewrite the same shard file atomically
-                out_path = self._atomic_write(self._shard_path(self._open_partial_idx), updated_tbl)
-                if out_path:
-                    written.append(out_path)
-
-                self._open_partial_remaining -= take_n
-                self._open_partial_tbl = updated_tbl if self._open_partial_remaining > 0 else None
-
-                # If we just filled it, advance shard index and clear partial state
-                if self._open_partial_remaining == 0:
-                    self.shard_idx = (self._open_partial_idx or 0) + 1
-                    self._open_partial_idx = None
-                    self._open_partial_tbl = None
+        if self._has_open_partial and self.buf.size() > 0:
+            out_path = self._top_up_partial_shard(self.buf.size())
+            if out_path:
+                written.append(out_path)
 
         # 2) Write any full shards from the buffer into *new* shard files
         while self.buf.size() >= self.rows_per_shard:
@@ -160,22 +178,8 @@ class ShardWriter:
 
         # If we still have a partial shard open, try topping it up one last time.
         last_path: str | None = None
-        if self._open_partial_idx is not None and self._open_partial_remaining > 0 and size > 0:
-            take_n = min(self._open_partial_remaining, size)
-            slice_cols = self.buf.take_first(take_n)
-            new_tbl = slice_cols.to_arrow_table()
-
-            assert self._open_partial_tbl is not None
-            updated_tbl = pa.concat_tables([self._open_partial_tbl, new_tbl], promote=True)
-            last_path = self._atomic_write(self._shard_path(self._open_partial_idx), updated_tbl)
-
-            self._open_partial_remaining -= take_n
-            self._open_partial_tbl = updated_tbl if self._open_partial_remaining > 0 else None
-
-            if self._open_partial_remaining == 0:
-                self.shard_idx = (self._open_partial_idx or 0) + 1
-                self._open_partial_idx = None
-                self._open_partial_tbl = None
+        if self._has_open_partial and size > 0:
+            last_path = self._top_up_partial_shard(size)
 
         # Now decide whether to write a *new* final partial shard
         remaining = self.buf.size()

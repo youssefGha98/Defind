@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import os
 import asyncio
+import os
 
 from defind.core.models import ChunkRecord
 
+
 class LiveManifest:
     """Thread-safe manifest writer for tracking chunk processing status.
-    
+
     Provides atomic append operations for chunk records with proper file locking.
     """
-    
+
     def __init__(self, path: str) -> None:
         """Initialize manifest at the given path.
-        
+
         Args:
             path: File path for the manifest JSONL file
         """
@@ -24,7 +25,7 @@ class LiveManifest:
 
     async def append(self, rec: ChunkRecord) -> None:
         """Append a chunk record to the manifest atomically.
-        
+
         Args:
             rec: ChunkRecord to write to the manifest
         """

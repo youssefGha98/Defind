@@ -1,0 +1,28 @@
+site_name: DefInd
+site_description: High-performance, Python-native DeFi log fetcher.
+site_author: youssefGha98
+repo_url: https://github.com/youssefGha98/defind
+repo_name: youssefGha98/defind
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.expand
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
