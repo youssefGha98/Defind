@@ -5,7 +5,7 @@ Features
 - Resumable via *live manifest* + historical coverage merging.
 - Dynamic projections: any registry projection key becomes a column.
 - Bounded memory via `rows_per_shard` and `batch_decode_rows`.
-- Automatic interval splitting on failures (`min_split_span`).
+- Automatic interval splitting on failures.
 
 Public API
 ----------
@@ -65,7 +65,6 @@ class ProcessContext:
     topic0s: list[str]
     registry: EventRegistry
     batch_decode_rows: int
-    min_split_span: int
     sem: asyncio.Semaphore
     agg_lock: asyncio.Lock
     manifest: LiveManifest
@@ -138,16 +137,10 @@ async def process_interval(ctx: ProcessContext, start_block: int, end_block: int
             await ctx.manifest.append(_create_done_record(a, b, len(logs), decoded_rows, shards_here, filtered_rows))
 
         except Exception as e:
-            span = b - a + 1
-            if span > ctx.min_split_span:
-                mid = (a + b) // 2
-                stack.extend([(a, mid), (mid + 1, b)])
-                ctx.stats.partially_covered_split += 1
-                await ctx.manifest.append(_create_failed_record(a, b, str(e)))
-            else:
-                ctx.stats.processed_failed += 1
-                await ctx.manifest.append(_create_failed_record(a, b, str(e)))
-
+            mid = (a + b) // 2
+            stack.extend([(a, mid), (mid + 1, b)])
+            ctx.stats.partially_covered_split += 1
+            await ctx.manifest.append(_create_failed_record(a, b, str(e)))
 
 # -------------------------
 # Helper factories
@@ -188,7 +181,7 @@ def _setup_directories(out_root: Path, address: str, topic0s: list[str]) -> Setu
     """
     address_lc = address.lower()
     topics_fp = topics_fingerprint(topic0s)
-    key_dir = out_root / f"{address_lc}__topics-{topics_fp}__universal"
+    key_dir = out_root / f"{address_lc}__topics-{topics_fp}"
     manifests_dir = key_dir / "manifests"
     manifests_dir.mkdir(exist_ok=True, parents=True)
     return SetupDirectoriesResult(
@@ -205,7 +198,7 @@ async def _resolve_block_range(rpc: RPC, start_block: int | str, end_block: int 
     """
     start = 0 if (isinstance(start_block, str) and start_block.lower() in ("earliest", "genesis")) else int(start_block)
     end = await rpc.latest_block() if (isinstance(end_block, str) and end_block.lower() == "latest") else int(end_block)
-
+    print(end)
     if start > end:
         raise ValueError("start_block must be <= end_block")
 
@@ -298,7 +291,6 @@ async def fetch_decode(
             topic0s=config.topic0s,
             registry=registry,
             batch_decode_rows=config.batch_decode_rows,
-            min_split_span=config.min_split_span,
             sem=sem,
             agg_lock=agg_lock,
             manifest=manifest,

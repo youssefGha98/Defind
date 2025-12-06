@@ -112,7 +112,6 @@ custom_spec = EventSpec(
 - **`rows_per_shard`**: Number of rows per Parquet file (default: 250,000)
 - **`batch_decode_rows`**: Batch size for decoding (default: 50,000)
 - **`concurrency`**: Max parallel RPC requests (default: 16)
-- **`min_split_span`**: Minimum block range for splitting on failures
 
 ### Performance Tuning
 
@@ -123,7 +122,6 @@ result = await fetch_decode(
     rows_per_shard=500_000,     # Larger shards
     batch_decode_rows=100_000,  # Larger batches
     concurrency=32,             # More parallelism
-    min_split_span=100,         # Aggressive splitting
 )
 ```
 

@@ -19,7 +19,6 @@ class OrchestratorConfig:
     rows_per_shard: int = 250_000
     batch_decode_rows: int = 10_000
     timeout_s: int = 20
-    min_split_span: int = 2_000
     write_final_partial: bool = True
 
 

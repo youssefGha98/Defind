@@ -18,7 +18,7 @@ class ShardsDir:
         addr_slug: str,
         topics_fp: str,
     ):
-        self.key_name = f"{addr_slug}__topics-{topics_fp}__universal"
+        self.key_name = f"{addr_slug}__topics-{topics_fp}"
         self.key_dir = out_root / self.key_name
         self.shards_dir = self.key_dir / "shards"
         self.shards_dir.mkdir(exist_ok=True, parents=True)

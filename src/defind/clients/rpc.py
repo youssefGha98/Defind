@@ -59,7 +59,6 @@ class RPC:
         """Return the latest block number as an int."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
         r = await self.client.post(self.url, json=payload)
-        r.raise_for_status()
         return int(r.json()["result"], 16)
 
     async def get_logs(
