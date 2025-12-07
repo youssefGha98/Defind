@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 
 from defind.core.models import ChunkRecord
+from defind.core.interfaces import IManifestRepository
 
 
-class LiveManifest:
+class LiveManifest(IManifestRepository):
     """Thread-safe manifest writer for tracking chunk processing status.
 
     Provides atomic append operations for chunk records with proper file locking.

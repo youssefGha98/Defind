@@ -13,6 +13,7 @@ from collections.abc import Sequence
 
 import httpx
 
+from defind.core.interfaces import IEvmLogsProvider
 from defind.core.models import EventLog
 
 
@@ -26,7 +27,7 @@ def topics_param(topic0s: Sequence[str]) -> list[list[str]]:
     return [[t.lower() for t in topic0s]]
 
 
-class RPC:
+class RPC(IEvmLogsProvider):
     """Minimal async RPC client.
 
     Parameters

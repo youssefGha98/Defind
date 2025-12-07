@@ -60,7 +60,7 @@ class Meta:
     block_timestamp: int | None
     tx_hash: str
     log_index: int
-    pool: str
+    address: str
 
 
 # === Manifest record ===

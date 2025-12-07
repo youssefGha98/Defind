@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from defind.core.models import Column
+from defind.core.interfaces import IEventShardsRepository
 
 
 class ShardsDir:
@@ -33,7 +34,7 @@ class ShardsDir:
         return self.shards_dir / f"shard_{idx:05d}.parquet"
 
 
-class ShardWriter:
+class ShardWriter(IEventShardsRepository):
     """
     Shard writer using dynamic columns:
     any projected key becomes a new column on the fly.

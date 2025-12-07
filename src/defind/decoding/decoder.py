@@ -127,7 +127,7 @@ def decode_event(
 
     return ParsedEvent(
         name=spec.name,
-        pool=to_checksum_address(meta.pool),
+        pool=to_checksum_address(meta.address),
         meta=meta,
         values=resolved,  # <- open-ended dict
     )
