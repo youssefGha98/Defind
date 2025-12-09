@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Protocol, runtime_checkable
 
-from defind.core.models import EventLog, ChunkRecord, Column
-from defind.decoding.specs import EventRegistry
+from defind.core.models import EventLog, ChunkRecord, Column, SetupDirectoriesResult
+from defind.core.config import OrchestratorConfig
 
 
 # ---------------------------------------------------------------------------
@@ -141,4 +141,10 @@ class IEventRegistryProvider(Protocol):
         - Etherscan fetcher
         - Database-backed registry
         """
+        ...
+
+class IDirectorySetup(Protocol):
+    """Abstract strategy for setting up output directories."""
+    
+    def setup(self, config: OrchestratorConfig) -> SetupDirectoriesResult:
         ...

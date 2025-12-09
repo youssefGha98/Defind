@@ -164,19 +164,12 @@ async def fetch_decode(
     )
 
     # 6) Output DTO
-    # Note: `shards_repo` implementation (e.g. ShardWriter) decides where
-    # shards are actually stored; here we only expose the base `shards_dir`.
-    # For the default ShardWriter, we can derive it from config + topics_fp.
-    shards_dir_obj = ShardsDir(
-        out_root=config.out_root,
-        addr_slug=address_lc,
-        topics_fp=topics_fp,
-    )
+    shards_dir_path = key_dir / "shards"
 
     return FetchDecodeOutput(
         stats=stats,
         key_dir=key_dir,
         manifests_dir=manifests_dir,
-        shards_dir=shards_dir_obj.shards_dir,
+        shards_dir=shards_dir_path,
     )
 

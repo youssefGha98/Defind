@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+from typing import Literal
 
 import pyarrow as pa
 
@@ -99,7 +100,15 @@ class ExtendedChunkRecord(ChunkRecord):
     rows_per_event: dict[str, int] | None = None  # per-event decoded rows
 
 
-# === Dynamic column buffer ===
+
+# === DTOs ===
+
+@dataclass(kw_only=True)
+class SetupDirectoriesResult:
+    """Result of setting up output directories."""
+    key_dir: Path
+    manifests_dir: Path
+
 
 
 @dataclass(slots=True)

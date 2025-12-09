@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
-from dataclasses import dataclass
-from defind.clients.rpc import RPC
+from defind.core.models import SetupDirectoriesResult
+from defind.storage.directories import get_directory_setup
 from defind.core.config import OrchestratorConfig
 from defind.decoding.specs import EventRegistry
 from defind.orchestration.orchestrator import (
@@ -15,54 +14,15 @@ from defind.orchestration.utils import topics_fingerprint
 from defind.storage.manifest import LiveManifest
 from defind.storage.shards import ShardsDir, ShardWriter, MultiEventShardWriter
 from defind.decoding.registry import EventRegistryProvider
-
-# ---------------------------------------------------------------------------
-# Setup helpers (filesystem-specific, application layer)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(kw_only=True)
-class SetupDirectoriesResult:
-    key_dir: Path
-    manifests_dir: Path
-
-def _setup_directories(
-    out_root: Path,
-    address: str,
-    topic0s: list[str],
-    *,
-    protocol_slug: str | None = None,
-    contract_slug: str | None = None,
-    shards_layout: str = "legacy",
-) -> SetupDirectoriesResult:
-    """Setup output directories for the fetch operation."""
-    if shards_layout == "per_event" and protocol_slug and contract_slug:
-        key_dir = out_root / f"proto-{protocol_slug}" / f"pool-{contract_slug}"
-    else:
-        address_lc = address.lower()
-        topics_fp = topics_fingerprint(topic0s)
-        key_dir = out_root / f"{address_lc}__topics-{topics_fp}"
-
-    manifests_dir = key_dir / "manifests"
-    manifests_dir.mkdir(exist_ok=True, parents=True)
-    return SetupDirectoriesResult(
-        key_dir=key_dir,
-        manifests_dir=manifests_dir,
-    )
+from defind.clients.rpc import RPC
 
 def _setup(config: OrchestratorConfig, registry: EventRegistry)->tuple[EventRegistryProvider,RPC,SetupDirectoriesResult]:
     """Common setup for both legacy and event-based fetch strategies."""
     registry_provider = EventRegistryProvider(registry)
 
     # Prepare filesystem directories
-    setup = _setup_directories(
-        out_root=config.out_root,
-        address=config.address,
-        topic0s=config.topic0s,
-        protocol_slug=config.protocol_slug,
-        contract_slug=config.contract_slug,
-        shards_layout=config.shards_layout,
-    )
+    dir_strategy = get_directory_setup(config)
+    setup = dir_strategy.setup(config)
 
     # Instantiate RPC
     rpc = RPC(
