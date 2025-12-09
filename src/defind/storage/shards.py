@@ -34,6 +34,29 @@ class ShardsDir:
         return self.shards_dir / f"shard_{idx:05d}.parquet"
 
 
+class SimpleShardsDir:
+    """
+    Minimal shard directory abstraction for pre-partitioned layouts.
+
+    Unlike `ShardsDir`, this assumes the caller already knows the exact shards
+    directory (e.g., out_root/proto/pool/shards/<event>/) and does not build a
+    key name from address/topic fingerprints.
+    """
+
+    def __init__(self, shards_dir: Path):
+        self.shards_dir = shards_dir
+        self.shards_dir.mkdir(exist_ok=True, parents=True)
+
+    def shards_files_pattern(self) -> str:
+        return (self.shards_dir / "shard_*.parquet").as_posix()
+
+    def list_shards(self) -> list[str]:
+        return sorted(glob.glob(self.shards_files_pattern()))
+
+    def shard_path(self, idx: int) -> Path:
+        return self.shards_dir / f"shard_{idx:05d}.parquet"
+
+
 class ShardWriter(IEventShardsRepository):
     """
     Shard writer using dynamic columns:
@@ -215,3 +238,73 @@ class ShardWriter(IEventShardsRepository):
             self.shard_idx += 1
             return out_path
         return last_path
+
+
+class MultiEventShardWriter(IEventShardsRepository):
+    """
+    Event-partitioning shard writer that routes rows into per-event subdirectories.
+
+    Layout example (no date partition, event-named subfolders):
+        <root>/
+          Mint/shard_00000.parquet
+          Burn/shard_00000.parquet
+          Swap/shard_00000.parquet
+
+    Compatibility:
+    - Leaves the existing ShardWriter untouched.
+    - Can coexist with legacy usage; callers choose which repository to inject.
+    """
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        rows_per_shard: int = 250_000,
+        codec: str = "zstd",
+        write_final_partial: bool = True,
+    ) -> None:
+        self.root = root
+        self.rows_per_shard = rows_per_shard
+        self.codec = codec
+        self.write_final_partial = write_final_partial
+        self._writers: dict[str, ShardWriter] = {}
+
+    def _writer_for_event(self, event: str) -> ShardWriter:
+        key = event or "unknown"
+        writer = self._writers.get(key)
+        if writer is None:
+            shards_dir = SimpleShardsDir(self.root / key)
+            writer = ShardWriter(
+                shards_dir=shards_dir,  # type: ignore[arg-type]
+                rows_per_shard=self.rows_per_shard,
+                codec=self.codec,
+                write_final_partial=self.write_final_partial,
+            )
+            self._writers[key] = writer
+        return writer
+
+    def add(self, column_batch: Column) -> list[Path]:
+        """
+        Group rows by `event` and write them to per-event shard writers.
+        """
+        if column_batch.size() == 0:
+            return []
+
+        idx_by_event: dict[str, list[int]] = {}
+        for i, ev in enumerate(column_batch.event):
+            key = ev or "unknown"
+            idx_by_event.setdefault(key, []).append(i)
+
+        written: list[Path] = []
+        for ev, indices in idx_by_event.items():
+            slice_cols = column_batch.take_indices(indices)
+            writer = self._writer_for_event(ev)
+            written.extend(writer.add(slice_cols))
+        return written
+
+    def close(self) -> Path | None:
+        last: Path | None = None
+        for writer in self._writers.values():
+            last_written = writer.close()
+            last = last_written or last
+        return last

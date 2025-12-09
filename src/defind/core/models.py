@@ -86,6 +86,19 @@ class ChunkRecord:
         return json.dumps(asdict(self), separators=(",", ":")) + "\n"
 
 
+@dataclass(slots=True)
+class ExtendedChunkRecord(ChunkRecord):
+    """
+    Extended manifest record carrying per-event stats (backward compatible).
+
+    - Keeps the base ChunkRecord fields intact for legacy consumers.
+    - Adds optional per-event shard and row counters for grouped writes.
+    """
+
+    shards_written: dict[str, int] | None = None  # per-event shards written
+    rows_per_event: dict[str, int] | None = None  # per-event decoded rows
+
+
 # === Dynamic column buffer ===
 
 
@@ -208,6 +221,30 @@ class Column:
             self.dyn[k] = col[n:]
         out._rows = n
         self._rows -= n
+        return out
+
+    def take_indices(self, indices: list[int]) -> Column:
+        """
+        Return a new Column containing only the specified row indices.
+
+        This is non-destructive (does not remove rows from self) and is useful
+        for partitioning by event/contract without mutating the original buffer.
+        """
+        out = Column()
+        if not indices:
+            return out
+
+        out.block_number = [self.block_number[i] for i in indices]
+        out.block_timestamp = [self.block_timestamp[i] for i in indices]
+        out.tx_hash = [self.tx_hash[i] for i in indices]
+        out.log_index = [self.log_index[i] for i in indices]
+        out.contract = [self.contract[i] for i in indices]
+        out.event = [self.event[i] for i in indices]
+
+        for k, col in self.dyn.items():
+            out.dyn[k] = [col[i] for i in indices]
+
+        out._rows = len(indices)
         return out
 
     def to_arrow_table(self) -> pa.Table:

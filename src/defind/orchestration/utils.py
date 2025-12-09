@@ -23,6 +23,13 @@ def topics_fingerprint(t0s: list[str]) -> str:
     return "x".join(x[:10] for x in uniq) if uniq else "none"
 
 
+def filters_fingerprint(address: str, topic0s: list[str]) -> str:
+    """Stable fingerprint for a single-address run with multiple topic0s."""
+    addr = (address or "").lower()
+    t_fp = topics_fingerprint(topic0s)
+    return f"{addr}__topics-{t_fp}"
+
+
 def iter_chunks(a: int, b: int, step: int) -> Generator[tuple[int, int], None, None]:
     """Yield inclusive [start, end] block ranges of size at most `step`."""
     x = a

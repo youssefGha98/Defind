@@ -20,6 +20,11 @@ class OrchestratorConfig:
     batch_decode_rows: int = 10_000
     timeout_s: int = 20
     write_final_partial: bool = True
+    # Optional enhancements (backward compatible defaults)
+    protocol_slug: str | None = None  # used for per-event shard layout
+    contract_slug: str | None = None  # used for per-event shard layout
+    shards_layout: str = "legacy"  # "legacy" or "per_event"
+    extended_manifest: bool = False  # emit ExtendedChunkRecord with per-event stats
 
 
 @dataclass(frozen=True)

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 from defind.core.interfaces import (
     IEvmLogsProvider,
@@ -11,7 +12,7 @@ from defind.core.interfaces import (
     IEventShardsRepository,
     IEventRegistryProvider,
 )
-from defind.core.models import ChunkRecord, Column, EventLog, Meta
+from defind.core.models import ChunkRecord, ExtendedChunkRecord, Column, EventLog, Meta
 from defind.decoding.decoder import decode_event
 from defind.decoding.specs import EventRegistry
 from defind.orchestration.utils import iter_chunks, subtract_iv
@@ -36,6 +37,10 @@ class FetchDecodeConfig:
     step: int
     concurrency: int
     batch_decode_rows: int
+    protocol_slug: str | None = None
+    contract_slug: str | None = None
+    shards_layout: str = "legacy"  # "legacy" or "per_event"
+    extended_manifest: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +104,8 @@ class ProcessContext:
     manifest: IManifestRepository
     aggregator: IEventShardsRepository
     stats: ProcessStats
+    shards_layout: str
+    extended_manifest: bool
 
 @dataclass(frozen=True)
 class WorkSeed:
@@ -199,22 +206,24 @@ def build_work_seeds(
 # ---------------------------------------------------------------------------
 
 
-async def _process_logs(
+async def _process_logs_core(
     ctx: ProcessContext,
     logs: list[EventLog],
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, dict[str, int], list[Path]]:
     """
-    Decode logs and write to the aggregator.
-
+    Core decoding logic shared by legacy and event strategies.
+    
     Returns
     -------
-    (decoded_rows, filtered_rows, shards_written)
+    (decoded_rows, filtered_rows, shards_written_count, rows_by_event, all_written_paths)
     """
     buf = Column.empty()
     rows_in_batch = 0
     decoded_rows = 0
     filtered_rows = 0
-    shards_written = 0
+    shards_written_count = 0
+    rows_by_event: dict[str, int] = defaultdict(int)
+    all_written_paths: list[Path] = []
 
     for ev in logs:
         if not ev.topics:
@@ -252,11 +261,13 @@ async def _process_logs(
         )
         rows_in_batch += 1
         decoded_rows += 1
+        rows_by_event[pe.name] += 1
 
         if rows_in_batch >= ctx.batch_decode_rows:
             async with ctx.agg_lock:
                 written = ctx.aggregator.add(buf)
-            shards_written += len(written)
+            shards_written_count += len(written)
+            all_written_paths.extend(written)
             buf = Column.empty()
             rows_in_batch = 0
 
@@ -264,25 +275,58 @@ async def _process_logs(
     if rows_in_batch > 0:
         async with ctx.agg_lock:
             written = ctx.aggregator.add(buf)
-        shards_written += len(written)
+        shards_written_count += len(written)
+        all_written_paths.extend(written)
 
-    return decoded_rows, filtered_rows, shards_written
+    return decoded_rows, filtered_rows, shards_written_count, dict(rows_by_event), all_written_paths
 
 
-async def process_interval(
+async def _process_logs_legacy(
+    ctx: ProcessContext,
+    logs: list[EventLog],
+) -> tuple[int, int, int, dict[str, int], dict[str, int]]:
+    """Legacy log processing: ignores per-event shard tracking."""
+    decoded, filtered, shards_written, rows_by_event, _ = await _process_logs_core(ctx, logs)
+    return decoded, filtered, shards_written, rows_by_event, {}
+
+
+async def _process_logs_event(
+    ctx: ProcessContext,
+    logs: list[EventLog],
+) -> tuple[int, int, int, dict[str, int], dict[str, int]]:
+    """Event log processing: computes per-event shard stats."""
+    decoded, filtered, shards_written, rows_by_event, written_paths = await _process_logs_core(ctx, logs)
+    
+    shards_by_event: dict[str, int] = defaultdict(int)
+    for p in written_paths:
+        # Assumes path structure .../EventName/shard_xxxxx.parquet
+        ev_name = p.parent.name
+        shards_by_event[ev_name] += 1
+        
+    return decoded, filtered, shards_written, rows_by_event, dict(shards_by_event)
+
+
+async def _process_logs(
+    ctx: ProcessContext,
+    logs: list[EventLog],
+) -> tuple[int, int, int, dict[str, int], dict[str, int]]:
+    """
+    Decode logs and write to the aggregator.
+    
+    Delegates to legacy or event strategy based on context layout.
+    """
+    if ctx.shards_layout == "per_event":
+        return await _process_logs_event(ctx, logs)
+    else:
+        return await _process_logs_legacy(ctx, logs)
+
+
+async def _process_interval_core(
     ctx: ProcessContext,
     seed: WorkSeed,
+    create_done_record: callable,
 ) -> None:
-    """
-    Process one inclusive [seed.start, seed.end] range with retry splitting.
-
-    This function:
-    - appends a 'started' record for each attemptsed interval,
-    - fetches logs from the IEvmLogsProvider,
-    - decodes and writes them via IEventShardsRepository,
-    - appends 'done' or 'failed' records to the manifest,
-    - splits the interval on failure and retries with smaller seeds.
-    """
+    """Core interval processing loop with retries."""
     stack: list[WorkSeed] = [seed]
 
     while stack:
@@ -302,26 +346,78 @@ async def process_interval(
             ctx.stats.executed_subranges += 1
             ctx.stats.total_logs += len(logs)
 
-            decoded_rows, filtered_rows, shards_here = await _process_logs(ctx, logs)
+            decoded_rows, filtered_rows, shards_here, rows_by_event, shards_by_event = await _process_logs(ctx, logs)
 
             ctx.stats.processed_ok += 1
             ctx.stats.shards_written += shards_here
-            await ctx.manifest.append(
-                _create_done_record(
-                    start_block,
-                    end_block,
-                    logs=len(logs),
-                    decoded=decoded_rows,
-                    shards=shards_here,
-                    filtered=filtered_rows,
-                )
+            
+            done_record = create_done_record(
+                start_block,
+                end_block,
+                len(logs),
+                decoded_rows,
+                shards_here,
+                filtered_rows,
+                rows_by_event,
+                shards_by_event
             )
+            await ctx.manifest.append(done_record)
 
         except Exception as e:
             left, right = current.split()
             stack.extend([left, right])
             ctx.stats.partially_covered_split += 1
             await ctx.manifest.append(_create_failed_record(start_block, end_block, str(e)))
+
+
+async def _process_interval_legacy(
+    ctx: ProcessContext,
+    seed: WorkSeed,
+) -> None:
+    """Legacy interval processing using standard ChunkRecord."""
+    def _create(start, end, logs, decoded, shards, filtered, rows_map, shards_map):
+        return _create_done_record(
+            start, end, logs, decoded, shards, filtered
+        )
+    
+    await _process_interval_core(ctx, seed, _create)
+
+
+async def _process_interval_event(
+    ctx: ProcessContext,
+    seed: WorkSeed,
+) -> None:
+    """Event interval processing using ExtendedChunkRecord."""
+    def _create(start, end, logs, decoded, shards, filtered, rows_map, shards_map):
+        return ExtendedChunkRecord(
+            from_block=start,
+            to_block=end,
+            status="done",
+            attempts=1,
+            error=None,
+            logs=logs,
+            decoded=decoded,
+            shards=shards,
+            updated_at=time.time(),
+            filtered=filtered,
+            shards_written=shards_map or None,
+            rows_per_event=rows_map or None,
+        )
+
+    await _process_interval_core(ctx, seed, _create)
+
+
+async def process_interval(
+    ctx: ProcessContext,
+    seed: WorkSeed,
+) -> None:
+    """
+    Process one inclusive [seed.start, seed.end] range with retry splitting.
+    """
+    if ctx.extended_manifest:
+        await _process_interval_event(ctx, seed)
+    else:
+        await _process_interval_legacy(ctx, seed)
 
 # ---------------------------------------------------------------------------
 # Domain service – FetchDecodeService
@@ -394,6 +490,8 @@ class FetchDecodeService:
             manifest=manifest_repo,
             aggregator=shards_repo,
             stats=stats,
+            shards_layout=config.shards_layout,
+            extended_manifest=config.extended_manifest,
         )
 
         # 3) Run workers concurrently over each seed

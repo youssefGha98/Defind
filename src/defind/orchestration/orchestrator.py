@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from defind.clients.rpc import RPC
 from defind.core.config import OrchestratorConfig
 from defind.core.interfaces import (
     IEvmLogsProvider,
@@ -49,33 +48,6 @@ from defind.storage.shards import ShardsDir, ShardWriter
 
 MIN_RPC_CONNECTIONS = 32
 
-
-# ---------------------------------------------------------------------------
-# Setup helpers (filesystem-specific, application layer)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(kw_only=True)
-class SetupDirectoriesResult:
-    key_dir: Path
-    manifests_dir: Path
-
-
-def _setup_directories(
-    out_root: Path,
-    address: str,
-    topic0s: list[str],
-) -> SetupDirectoriesResult:
-    """Setup output directories for the fetch operation."""
-    address_lc = address.lower()
-    topics_fp = topics_fingerprint(topic0s)
-    key_dir = out_root / f"{address_lc}__topics-{topics_fp}"
-    manifests_dir = key_dir / "manifests"
-    manifests_dir.mkdir(exist_ok=True, parents=True)
-    return SetupDirectoriesResult(
-        key_dir=key_dir,
-        manifests_dir=manifests_dir,
-    )
 
 
 async def _resolve_block_range(

@@ -44,9 +44,9 @@ class IEvmLogsProvider(Protocol):
         Return the current chain head height.
 
         Implementations may:
-        - Query an RPC node
-        - Query a database
-        - Return a static value for testing
+            - Query an RPC node
+            - Query a database
+            - Return a static value for testing
         """
         ...
 
