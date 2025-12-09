@@ -100,6 +100,7 @@ async def fetch_decode(
     shards_repo: IEventShardsRepository,
     key_dir: Path,
     manifests_dir: Path,
+    run_id: str,
 ) -> FetchDecodeOutput:
     """Pure application-layer orchestrator.
 
@@ -120,21 +121,13 @@ async def fetch_decode(
         end_block=config.end_block,
     )
 
-    # 2) Build run-specific manifest file name (still filesystem-specific)
-    address_lc = config.address.lower()
-    topics_fp = topics_fingerprint(config.topic0s)
-    run_basename = (
-        f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_"
-        f"{address_lc}_{topics_fp}_{start}_{end}.jsonl"
-    )
-
-    # 3) Historical coverage (application concern, uses filesystem utils)
+    # 2) Historical coverage (application concern, uses filesystem utils)
     covered = load_done_coverage(
         manifests_dir=manifests_dir,
-        exclude_basename=run_basename,
+        exclude_basename=run_id,
     )
 
-    # 4) Domain-level configuration
+    # 3) Domain-level configuration
     domain_config = FetchDecodeConfig(
         address=config.address,
         topic0s=config.topic0s,

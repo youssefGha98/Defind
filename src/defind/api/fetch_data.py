@@ -16,13 +16,14 @@ from defind.storage.shards import ShardsDir, ShardWriter, MultiEventShardWriter
 from defind.decoding.registry import EventRegistryProvider
 from defind.clients.rpc import RPC
 
-def _setup(config: OrchestratorConfig, registry: EventRegistry)->tuple[EventRegistryProvider,RPC,SetupDirectoriesResult]:
+def _setup(config: OrchestratorConfig, registry: EventRegistry)->tuple[EventRegistryProvider,RPC,SetupDirectoriesResult,str]:
     """Common setup for both legacy and event-based fetch strategies."""
     registry_provider = EventRegistryProvider(registry)
 
     # Prepare filesystem directories
     dir_strategy = get_directory_setup(config)
     setup = dir_strategy.setup(config)
+    run_basename = dir_strategy.get_run_basename(config)
 
     # Instantiate RPC
     rpc = RPC(
@@ -31,7 +32,7 @@ def _setup(config: OrchestratorConfig, registry: EventRegistry)->tuple[EventRegi
         max_connections=max(32, 2 * config.concurrency),
     )
 
-    return registry_provider, rpc, setup
+    return registry_provider, rpc, setup, run_basename
 
 
 async def _fetch_data_legacy(
@@ -39,15 +40,12 @@ async def _fetch_data_legacy(
     registry_provider: EventRegistryProvider,
     rpc: RPC,
     setup: SetupDirectoriesResult,
+    run_basename: str,
 ) -> FetchDecodeOutput:
     """Legacy fetch strategy: shards by address+topics fingerprint."""
     address_lc = config.address.lower()
     topics_fp = topics_fingerprint(config.topic0s)
     
-    run_basename = (
-        f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_"
-        f"{address_lc}_{topics_fp}_{config.start_block}_{config.end_block}.jsonl"
-    )
     manifest_path = setup.manifests_dir / run_basename
     manifest_repo = LiveManifest(manifest_path)
 
@@ -70,6 +68,7 @@ async def _fetch_data_legacy(
         shards_repo=shards_repo,
         key_dir=setup.key_dir,
         manifests_dir=setup.manifests_dir,
+        run_id=run_basename,
     )
 
 
@@ -78,13 +77,9 @@ async def _fetch_data_event(
     registry_provider: EventRegistryProvider,
     rpc: RPC,
     setup: SetupDirectoriesResult,
+    run_basename: str,
 ) -> FetchDecodeOutput:
     """Event-based fetch strategy: shards by protocol/pool/event."""
-    run_basename = (
-        f"run_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_"
-        f"proto-{config.protocol_slug}_pool-{config.contract_slug}_{config.start_block}_{config.end_block}.jsonl"
-    )
-    print(run_basename)
     manifest_path = setup.manifests_dir / run_basename
     manifest_repo = LiveManifest(manifest_path)
 
@@ -104,6 +99,7 @@ async def _fetch_data_event(
         shards_repo=shards_repo,
         key_dir=setup.key_dir,
         manifests_dir=setup.manifests_dir,
+        run_id=run_basename,
     )
 
 
@@ -116,7 +112,7 @@ async def fetch_data(
     High-level convenience API for notebooks / scripts.
     Delegates to legacy or event-based strategy depending on config.
     """
-    registry_provider, rpc, setup = _setup(config, registry)
+    registry_provider, rpc, setup, run_basename = _setup(config, registry)
 
     try:
         shards_layout = config.shards_layout
@@ -130,8 +126,8 @@ async def fetch_data(
         )
 
         if is_event_layout:
-            return await _fetch_data_event(config, registry_provider, rpc, setup)
+            return await _fetch_data_event(config, registry_provider, rpc, setup, run_basename)
         else:
-            return await _fetch_data_legacy(config, registry_provider, rpc, setup)
+            return await _fetch_data_legacy(config, registry_provider, rpc, setup, run_basename)
     finally:
         await rpc.aclose()

@@ -148,3 +148,6 @@ class IDirectorySetup(Protocol):
     
     def setup(self, config: OrchestratorConfig) -> SetupDirectoriesResult:
         ...
+
+    def get_run_basename(self, config: OrchestratorConfig) -> str:
+        ...
