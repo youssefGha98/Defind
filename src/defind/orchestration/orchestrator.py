@@ -1,61 +1,54 @@
-"""Streaming orchestrator: fetch → decode → write universal shards.
+"""Streaming orchestrator: fetch → decode → write chunk files.
 
-This module provides two layers:
-
-1) `run_fetch_decode_use_case(...)`:
-   - Pure application-layer use case.
-   - Depends ONLY on interfaces (IEvmLogsProvider, IManifestRepository,
-     IEventShardsRepository, IEventRegistryProvider).
-   - Does NOT instantiate RPC, LiveManifest, ShardWriter, etc.
-   - Does NOT manage lifecycle (e.g., closing RPC).
-
-2) `fetch_decode(...)` (optional convenience wrapper):
-   - Wires concrete implementations (RPC, LiveManifest, ShardWriter) for
-     typical CLI / script usage.
-   - Calls `run_fetch_decode_use_case(...)` under the hood.
+Provides:
+1) `fetch_decode(config, registry)` — convenience wrapper that wires concrete
+   implementations (RPC, LocalChunkStorage or S3ChunkStorage) and runs the
+   full pipeline.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from defind.core.config import OrchestratorConfig
-from defind.core.interfaces import (
-    IEvmLogsProvider,
-    IManifestRepository,
-    IEventShardsRepository,
-    IEventRegistryProvider,
-)
+from defind.core.interfaces import IChunkStorage
 from defind.core.use_cases.fetch_decode import (
     FetchDecodeConfig,
     FetchDecodeService,
     ProcessStats,
     build_work_seeds,
 )
-from defind.orchestration.utils import (
-    load_done_coverage,
-    topics_fingerprint,
-)
-from defind.storage.manifest import LiveManifest
-from defind.storage.shards import ShardsDir, ShardWriter
+from defind.decoding.registry import EventRegistryProvider
+from defind.decoding.specs import EventRegistry
+from defind.clients.rpc import RPC
+from defind.orchestration.utils import load_done_coverage
+from defind.storage.local import LocalChunkStorage
+from defind.storage.s3 import S3ChunkStorage
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Output DTO
 # ---------------------------------------------------------------------------
 
-MIN_RPC_CONNECTIONS = 32
 
+@dataclass(kw_only=True)
+class FetchDecodeOutput:
+    """High-level output of the orchestrator."""
+    stats: ProcessStats
+    contract_dir: str   # root key/path for all chunks of this contract
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 async def _resolve_block_range(
-    logs_provider: IEvmLogsProvider,
+    logs_provider,
     start_block: int | str,
     end_block: int | str,
 ) -> tuple[int, int]:
-    """Resolve start and end blocks, handling special values like 'latest'."""
     if isinstance(start_block, str) and start_block.lower() in ("earliest", "genesis"):
         start = 0
     else:
@@ -72,97 +65,95 @@ async def _resolve_block_range(
     return start, end
 
 
+def _build_storage(config: OrchestratorConfig) -> tuple[IChunkStorage, str]:
+    """Build the appropriate storage backend from config.
+
+    Returns (storage, contract_dir_description) where contract_dir_description
+    is a human-readable string for logging/output.
+    """
+    contract_subpath = f"{config.protocol_slug}/{config.contract_slug}"
+
+    if config.s3_bucket:
+        prefix = f"{config.s3_prefix.rstrip('/')}/{contract_subpath}/" if config.s3_prefix else f"{contract_subpath}/"
+        storage = S3ChunkStorage(
+            bucket=config.s3_bucket,
+            prefix=prefix,
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        contract_dir = f"s3://{config.s3_bucket}/{prefix}"
+    else:
+        root = config.out_root / config.protocol_slug / config.contract_slug
+        storage = LocalChunkStorage(root)
+        contract_dir = str(root)
+
+    return storage, contract_dir
+
+
 # ---------------------------------------------------------------------------
-# Output DTO
-# ---------------------------------------------------------------------------
-
-
-@dataclass(kw_only=True)
-class FetchDecodeOutput:
-    """High-level output of the orchestrator."""
-    stats: ProcessStats
-    key_dir: Path
-    manifests_dir: Path
-    shards_dir: Path
-
-
-# ---------------------------------------------------------------------------
-# 1) Pure application use case (no concrete instantiation)
+# Main entrypoint
 # ---------------------------------------------------------------------------
 
 
 async def fetch_decode(
     *,
     config: OrchestratorConfig,
-    registry_provider: IEventRegistryProvider,
-    logs_provider: IEvmLogsProvider,
-    manifest_repo: IManifestRepository,
-    shards_repo: IEventShardsRepository,
-    key_dir: Path,
-    manifests_dir: Path,
-    run_id: str,
+    registry: EventRegistry,
 ) -> FetchDecodeOutput:
-    """Pure application-layer orchestrator.
+    """Convenience wrapper: wires concrete implementations and runs the pipeline.
 
-    This function:
-    - Resolves the block range using the injected logs provider.
-    - Computes coverage using the filesystem-based manifest directory.
-    - Builds work seeds using domain helper `build_work_seeds`.
-    - Invokes the domain use case `FetchDecodeService`.
-
-    It does NOT:
-    - Instantiate RPC / LiveManifest / ShardWriter.
-    - Manage lifecycle (e.g., closing RPC clients).
+    - Resolves block range (handles "latest").
+    - Builds storage backend (local or S3).
+    - Loads coverage from existing chunk files.
+    - Runs fetch → decode → write for uncovered ranges.
     """
-    # 1) Resolve block range
-    start, end = await _resolve_block_range(
-        logs_provider=logs_provider,
-        start_block=config.start_block,
-        end_block=config.end_block,
+    registry_provider = EventRegistryProvider(registry)
+    event_names = [spec.name for spec in registry.values()]
+
+    rpc = RPC(
+        config.rpc_url,
+        timeout_s=config.timeout_s,
+        max_connections=max(32, 2 * config.concurrency),
     )
 
-    # 2) Historical coverage (application concern, uses filesystem utils)
-    covered = load_done_coverage(
-        manifests_dir=manifests_dir,
-        exclude_basename=run_id,
-    )
+    storage, contract_dir = _build_storage(config)
 
-    # 3) Domain-level configuration
-    domain_config = FetchDecodeConfig(
-        address=config.address,
-        topic0s=config.topic0s,
-        step=config.step,
-        concurrency=config.concurrency,
-        batch_decode_rows=config.batch_decode_rows,
-    )
+    try:
+        start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
 
-    seeds = build_work_seeds(
-        start=start,
-        end=end,
-        step=domain_config.step,
-        covered=covered,
-    )
+        covered = load_done_coverage(storage, event_names)
 
-    # 5) Domain service invocation
-    service = FetchDecodeService(
-        logs_provider=logs_provider,
-        registry_provider=registry_provider,
-    )
+        effective_chunk_size = config.chunk_size if config.chunk_size is not None else config.step
 
-    stats = await service.run(
-        config=domain_config,
-        manifest_repo=manifest_repo,
-        shards_repo=shards_repo,
-        seeds=seeds,
-    )
+        domain_config = FetchDecodeConfig(
+            address=config.address,
+            topic0s=config.topic0s,
+            step=config.step,
+            chunk_size=effective_chunk_size,
+            concurrency=config.concurrency,
+        )
 
-    # 6) Output DTO
-    shards_dir_path = key_dir / "shards"
+        seeds = build_work_seeds(
+            start=start,
+            end=end,
+            chunk_size=effective_chunk_size,
+            covered=covered,
+        )
 
-    return FetchDecodeOutput(
-        stats=stats,
-        key_dir=key_dir,
-        manifests_dir=manifests_dir,
-        shards_dir=shards_dir_path,
-    )
+        service = FetchDecodeService(
+            logs_provider=rpc,
+            registry_provider=registry_provider,
+        )
 
+        stats = await service.run(
+            config=domain_config,
+            storage=storage,
+            seeds=seeds,
+        )
+
+    finally:
+        await rpc.aclose()
+
+    return FetchDecodeOutput(stats=stats, contract_dir=contract_dir)

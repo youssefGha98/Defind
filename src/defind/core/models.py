@@ -2,7 +2,6 @@
 
 This module defines:
 - `EventLog`: minimal RPC log record used by the decoder.
-- `ChunkRecord`: manifest entry used for resumability and coverage.
 - `Column`: dynamic, append-only columnar buffer where *any*
    projection key becomes its own Parquet column.
 
@@ -16,16 +15,14 @@ Design notes
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any
 
 import pyarrow as pa
 
 # === Base schema (Arrow) ===
 
-_BASE_FIELDS: list[tuple[str, pa.DataType]] = [
+BASE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("block_number", pa.uint64()),
     ("block_timestamp", pa.uint64()),
     ("tx_hash", pa.string()),
@@ -33,8 +30,6 @@ _BASE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("contract", pa.string()),
     ("event", pa.string()),
 ]
-
-Status = Literal["started", "done", "failed"]
 
 
 # === RPC record ===
@@ -62,53 +57,6 @@ class Meta:
     tx_hash: str
     log_index: int
     address: str
-
-
-# === Manifest record ===
-
-
-@dataclass(slots=True)
-class ChunkRecord:
-    """A single chunk execution record persisted to the live manifest."""
-
-    from_block: int
-    to_block: int
-    status: Status
-    attempts: int
-    error: str | None
-    logs: int  # raw logs fetched
-    decoded: int  # kept rows
-    shards: int  # shard files written due to this chunk
-    updated_at: float
-    filtered: int = 0  # rows skipped by fast filter
-
-    def to_json_line(self) -> str:
-        """Serialize as a compact JSON line."""
-        return json.dumps(asdict(self), separators=(",", ":")) + "\n"
-
-
-@dataclass(slots=True)
-class ExtendedChunkRecord(ChunkRecord):
-    """
-    Extended manifest record carrying per-event stats (backward compatible).
-
-    - Keeps the base ChunkRecord fields intact for legacy consumers.
-    - Adds optional per-event shard and row counters for grouped writes.
-    """
-
-    shards_written: dict[str, int] | None = None  # per-event shards written
-    rows_per_event: dict[str, int] | None = None  # per-event decoded rows
-
-
-
-# === DTOs ===
-
-@dataclass(kw_only=True)
-class SetupDirectoriesResult:
-    """Result of setting up output directories."""
-    key_dir: Path
-    manifests_dir: Path
-
 
 
 @dataclass(slots=True)
@@ -236,8 +184,7 @@ class Column:
         """
         Return a new Column containing only the specified row indices.
 
-        This is non-destructive (does not remove rows from self) and is useful
-        for partitioning by event/contract without mutating the original buffer.
+        Non-destructive: does not remove rows from self.
         """
         out = Column()
         if not indices:
@@ -258,7 +205,7 @@ class Column:
 
     def to_arrow_table(self) -> pa.Table:
         """Convert the buffer to a sorted Arrow table with deterministic schema."""
-        fields = [pa.field(n, t) for n, t in _BASE_FIELDS]
+        fields = [pa.field(n, t) for n, t in BASE_FIELDS]
         arrays: dict[str, pa.Array] = {
             "block_number": pa.array(self.block_number, type=pa.uint64()),
             "block_timestamp": pa.array(self.block_timestamp, type=pa.uint64()),

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List, Protocol, runtime_checkable
 
-from defind.core.models import EventLog, ChunkRecord, Column, SetupDirectoriesResult
-from defind.core.config import OrchestratorConfig
+import pyarrow as pa
+
+from defind.core.models import EventLog, Column
 
 
 # ---------------------------------------------------------------------------
@@ -29,90 +29,9 @@ class IEvmLogsProvider(Protocol):
         from_block: int,
         to_block: int,
     ) -> List[EventLog]:
-        """
-        Return all logs for (address, topic0s) over the inclusive block range.
-
-        Implementations:
-        - RPC-based (current `RPC` class)
-        - Log archive reader
-        - In-memory or synthetic provider for testing
-        """
         ...
 
     async def latest_block(self) -> int:
-        """
-        Return the current chain head height.
-
-        Implementations may:
-            - Query an RPC node
-            - Query a database
-            - Return a static value for testing
-        """
-        ...
-
-
-# ---------------------------------------------------------------------------
-# IManifestRepository
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class IManifestRepository(Protocol):
-    """
-    Append-only manifest repository for chunk status tracking.
-
-    Domain expectations:
-    - The manifest acts as an append-only journal.
-    - Reading / aggregating coverage is an application-level responsibility.
-    """
-
-    async def append(self, record: ChunkRecord) -> None:
-        """
-        Append a new ChunkRecord (started/done/failed).
-
-        Implementations:
-        - LiveManifest (JSONL file writer)
-        - Database-backed manifest
-        - Remote logging system
-        """
-        ...
-
-
-# ---------------------------------------------------------------------------
-# IEventShardsRepository
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class IEventShardsRepository(Protocol):
-    """
-    Abstract sink for decoded event rows.
-
-    Domain expectations:
-    - It accepts batches of Column objects.
-    - It may produce one or more completed "shards" when thresholds are reached.
-    - The domain only cares about how many shards were produced.
-    """
-
-    def add(self, column_batch: Column) -> List[Path]:
-        """
-        Add a batch of decoded rows.
-
-        Returns
-        -------
-        List[Path]
-            Identifiers (e.g. file paths) of shards that were written or rewritten.
-            The domain never inspects the Path objects, only their count.
-        """
-        ...
-
-    def close(self) -> Path | None:
-        """
-        Flush and finalize any remaining buffered rows.
-
-        Returns
-        -------
-        Path | None
-            Identifier of the last written shard, or None if nothing was written.
-        """
         ...
 
 
@@ -124,30 +43,45 @@ class IEventShardsRepository(Protocol):
 class IEventRegistryProvider(Protocol):
     """
     Abstract provider of EventRegistry objects used for decoding events.
-
-    Domain expectations:
-    - It provides a fully initialized EventRegistry.
-    - How this registry is built (from ABIs, filesystem, Etherscan, DB...) is an
-      infrastructure concern.
     """
 
-    def get_registry(self) -> EventRegistry:
-        """
-        Return a fully configured EventRegistry instance.
+    def get_registry(self):
+        ...
 
-        Implementations:
-        - Static provider wrapping an already-created registry
-        - ABI loader
-        - Etherscan fetcher
-        - Database-backed registry
+
+# ---------------------------------------------------------------------------
+# IChunkStorage
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class IChunkStorage(Protocol):
+    """
+    Abstract storage backend for chunk files (local or S3).
+
+    A "chunk" is a Parquet file keyed by `{EventName}/chunk_{from:010d}_{to:010d}.parquet`.
+
+    Domain expectations:
+    - Hides the underlying storage technology (local filesystem, S3, R2, etc.).
+    - write_table always writes, even for empty tables (0 rows are valid markers).
+    """
+
+    def write_table(self, key: str, table: pa.Table, codec: str) -> None:
+        """
+        Write parquet table at the given key.
+
+        Writes even for 0-row tables (empty file = marker that this chunk was processed).
         """
         ...
 
-class IDirectorySetup(Protocol):
-    """Abstract strategy for setting up output directories."""
-    
-    def setup(self, config: OrchestratorConfig) -> SetupDirectoriesResult:
+    def exists(self, key: str) -> bool:
+        """Check if a key exists in storage."""
         ...
 
-    def get_run_basename(self, config: OrchestratorConfig) -> str:
+    def list_keys(self, prefix: str) -> list[str]:
+        """
+        List all keys that start with the given prefix.
+
+        Returns relative keys (not full paths).
+        Example: list_keys("Mint/") → ["Mint/chunk_0000000100_0000005099.parquet", ...]
+        """
         ...
