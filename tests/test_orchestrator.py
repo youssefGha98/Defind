@@ -58,7 +58,7 @@ async def test_fetch_decode_empty_seeds(mock_rpc: Any) -> None:
     with (
         patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
         patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
-        patch("defind.orchestration.orchestrator.load_done_coverage", return_value=[]),
+        patch("defind.orchestration.orchestrator.load_done_chunks", return_value=[]),
         patch("defind.orchestration.orchestrator.build_work_seeds", return_value=[]),
     ):
         output = await fetch_decode(config=_base_config(), registry=registry)
@@ -88,7 +88,7 @@ async def test_fetch_decode_with_work(mock_rpc: Any) -> None:
     with (
         patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
         patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
-        patch("defind.orchestration.orchestrator.load_done_coverage", return_value=[]),
+        patch("defind.orchestration.orchestrator.load_done_chunks", return_value=[]),
         patch("defind.orchestration.orchestrator.build_work_seeds", return_value=[WorkSeed(0, 100)]),
     ):
         output = await fetch_decode(config=_base_config(), registry=registry)
@@ -101,7 +101,7 @@ async def test_fetch_decode_with_work(mock_rpc: Any) -> None:
 @pytest.mark.asyncio
 async def test_process_interval_single_block_rpc_error_raises_without_infinite_split() -> None:
     rpc = AsyncMock()
-    rpc.get_logs = AsyncMock(side_effect=RuntimeError("rpc unavailable"))
+    rpc.get_logs = AsyncMock(side_effect=ConnectionError("rpc unavailable"))
 
     registry = _make_registry()
     storage = MagicMock()
@@ -117,6 +117,7 @@ async def test_process_interval_single_block_rpc_error_raises_without_infinite_s
         event_names=["TestEvent"],
         step=10,
         codec="lz4",
+        print_chunk_writes=False,
         stats=ProcessStats(),
     )
 
@@ -145,6 +146,7 @@ async def test_process_interval_does_not_split_on_decode_write_error() -> None:
         event_names=["TestEvent"],
         step=1000,
         codec="lz4",
+        print_chunk_writes=False,
         stats=ProcessStats(),
     )
 
@@ -153,6 +155,42 @@ async def test_process_interval_does_not_split_on_decode_write_error() -> None:
             await process_interval(ctx, WorkSeed(10, 20))
 
     assert rpc.get_logs.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_interval_splits_on_rpc_error_code_then_recovers() -> None:
+    rpc = AsyncMock()
+    rpc.get_logs = AsyncMock(
+        side_effect=[
+            RuntimeError("RPC error: -32005 query returned more than 10000 results"),
+            [],
+            [],
+        ]
+    )
+
+    registry = _make_registry()
+    storage = MagicMock()
+    storage.exists.return_value = False
+    storage.write_table.return_value = None
+
+    ctx = ProcessContext(
+        rpc=rpc,
+        address=ADDR,
+        topic0s=["0xabc"],
+        registry=registry,
+        sem=asyncio.Semaphore(1),
+        storage=storage,
+        event_names=["TestEvent"],
+        step=1000,
+        codec="lz4",
+        print_chunk_writes=False,
+        stats=ProcessStats(),
+    )
+
+    await process_interval(ctx, WorkSeed(0, 1))
+
+    assert rpc.get_logs.await_count == 3
+    assert ctx.stats.partially_covered_split == 1
 
 
 @pytest.mark.asyncio
@@ -175,7 +213,7 @@ async def test_fetch_decode_listen_continues_after_backfill(mock_rpc: Any) -> No
     with (
         patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
         patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
-        patch("defind.orchestration.orchestrator.load_done_coverage", return_value=[]),
+        patch("defind.orchestration.orchestrator.load_done_chunks", return_value=[]),
         patch(
             "defind.orchestration.orchestrator.build_work_seeds",
             side_effect=[[WorkSeed(0, 100)], [WorkSeed(101, 102)]],
@@ -201,3 +239,33 @@ async def test_fetch_decode_listen_continues_after_backfill(mock_rpc: Any) -> No
     assert build_seeds_mock.call_args_list[0].kwargs["end"] == 100
     assert build_seeds_mock.call_args_list[1].kwargs["start"] == 101
     assert build_seeds_mock.call_args_list[1].kwargs["end"] == 102
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_extends_last_partial_chunk_and_deletes_old_one(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    mock_storage = MagicMock()
+    mock_storage.exists.return_value = False
+    mock_storage.list_keys.return_value = []
+    mock_storage.delete.return_value = None
+
+    service = MagicMock()
+    service.run = AsyncMock(return_value=ProcessStats(processed_ok=1, total_logs=3))
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
+        patch(
+            "defind.orchestration.orchestrator.load_done_chunks",
+            return_value=[(0, 99)],
+        ),
+        patch("defind.orchestration.orchestrator.FetchDecodeService", return_value=service),
+    ):
+        await fetch_decode(
+            config=_base_config(end_block=120, chunk_size=200),
+            registry=registry,
+        )
+
+    seeds = service.run.await_args.kwargs["seeds"]
+    assert seeds == [WorkSeed(0, 120)]
+    mock_storage.delete.assert_called_once_with("TestEvent/chunk_0000000000_0000000099.parquet")

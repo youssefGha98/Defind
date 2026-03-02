@@ -23,9 +23,12 @@ class OrchestratorConfig:
                                    # None → même valeur que step (1 fichier par step)
     concurrency: int = 16
     timeout_s: int = 20
+    rpc_max_retries: int = 3
+    rpc_retry_backoff_s: float = 0.5
     codec: str = "lz4"            # compression Parquet ("lz4", "zstd", "snappy", "none")
     listen: bool = False          # continue polling after backfill
     listen_poll_interval_s: float = 2.0
+    print_chunk_writes: bool = False  # print each written chunk key/interval
 
     # Local storage (used when s3_bucket is None)
     out_root: Path = Path("./data")
@@ -37,4 +40,3 @@ class OrchestratorConfig:
     s3_access_key: str | None = None
     s3_secret_key: str | None = None
     s3_region: str = "auto"
-

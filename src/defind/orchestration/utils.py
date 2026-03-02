@@ -12,6 +12,7 @@ All intervals are inclusive on both ends: [start, end].
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
 
 from defind.core.interfaces import IChunkStorage
@@ -46,6 +47,30 @@ def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             out.append([s, e])
     return [(s, e) for s, e in out]
+
+
+def intersect_intervals(
+    left: list[tuple[int, int]],
+    right: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Intersect two sorted inclusive interval lists."""
+    if not left or not right:
+        return []
+
+    out: list[tuple[int, int]] = []
+    i, j = 0, 0
+    while i < len(left) and j < len(right):
+        ls, le = left[i]
+        rs, re = right[j]
+        s = max(ls, rs)
+        e = min(le, re)
+        if s <= e:
+            out.append((s, e))
+        if le < re:
+            i += 1
+        else:
+            j += 1
+    return merge_intervals(out)
 
 
 def subtract_iv(iv: tuple[int, int], covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -97,6 +122,32 @@ def load_done_coverage(
     if not event_names:
         return []
 
+    per_event: list[list[tuple[int, int]]] = []
+    for ev in event_names:
+        chunks: list[tuple[int, int]] = []
+        for key in storage.list_keys(f"{ev}/"):
+            parsed = parse_chunk_key(key)
+            if parsed is not None:
+                chunks.append(parsed)
+        per_event.append(merge_intervals(chunks))
+
+    # A block is done only if it is covered by every event family.
+    done = per_event[0]
+    for cov in per_event[1:]:
+        done = intersect_intervals(done, cov)
+        if not done:
+            break
+    return done
+
+
+def load_done_chunks(
+    storage: IChunkStorage,
+    event_names: list[str],
+) -> list[tuple[int, int]]:
+    """Load exact done chunk intervals present for ALL event names."""
+    if not event_names:
+        return []
+
     per_event: list[set[tuple[int, int]]] = []
     for ev in event_names:
         chunks: set[tuple[int, int]] = set()
@@ -106,9 +157,40 @@ def load_done_coverage(
                 chunks.add(parsed)
         per_event.append(chunks)
 
-    # A chunk is done only if it appears in every event's set
     done = per_event[0].intersection(*per_event[1:])
-    return merge_intervals(sorted(done))
+    return sorted(done)
+
+
+@dataclass(frozen=True)
+class RangeCompletion:
+    """Completion report for a requested inclusive block range."""
+
+    start: int
+    end: int
+    covered: list[tuple[int, int]]
+    missing: list[tuple[int, int]]
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.missing) == 0
+
+
+def check_range_completion(
+    *,
+    storage: IChunkStorage,
+    event_names: list[str],
+    start: int,
+    end: int,
+) -> RangeCompletion:
+    """Return whether [start, end] is fully covered by existing chunks."""
+    covered = load_done_coverage(storage, event_names)
+    missing = subtract_iv((start, end), covered)
+    return RangeCompletion(
+        start=start,
+        end=end,
+        covered=covered,
+        missing=missing,
+    )
 
 
 def to_hex_block(block: int | str) -> str:

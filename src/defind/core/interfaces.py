@@ -85,3 +85,7 @@ class IChunkStorage(Protocol):
         Example: list_keys("Mint/") → ["Mint/chunk_0000000100_0000005099.parquet", ...]
         """
         ...
+
+    def delete(self, key: str) -> None:
+        """Delete a key if present (best effort for idempotent maintenance)."""
+        ...

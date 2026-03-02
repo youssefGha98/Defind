@@ -47,3 +47,10 @@ class LocalChunkStorage(IChunkStorage):
             str(p.relative_to(self.root))
             for p in base.rglob("*.parquet")
         ]
+
+    def delete(self, key: str) -> None:
+        path = self._full_path(key)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass

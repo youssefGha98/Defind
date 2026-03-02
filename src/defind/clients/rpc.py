@@ -9,6 +9,7 @@ It returns `EventLog` records ready for downstream decoding.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 import httpx
@@ -40,8 +41,18 @@ class RPC(IEvmLogsProvider):
         Maximum concurrent connections to keep in the pool.
     """
 
-    def __init__(self, url: str, *, timeout_s: int = 20, max_connections: int = 64) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_s: int = 20,
+        max_connections: int = 64,
+        max_retries: int = 3,
+        retry_backoff_s: float = 0.5,
+    ) -> None:
         self.url = url
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_s = max(0.0, float(retry_backoff_s))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=timeout_s,
@@ -56,11 +67,36 @@ class RPC(IEvmLogsProvider):
             http2=True,
         )
 
+    async def _post_json(self, payload: dict) -> dict:
+        delay = self.retry_backoff_s
+        attempt = 0
+        while True:
+            try:
+                r = await self.client.post(self.url, json=payload)
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                retryable = status in (408, 425, 429, 500, 502, 503, 504)
+                if (not retryable) or attempt >= self.max_retries:
+                    raise
+            except (httpx.TransportError, httpx.TimeoutException):
+                if attempt >= self.max_retries:
+                    raise
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 8.0)
+            attempt += 1
+
     async def latest_block(self) -> int:
         """Return the latest block number as an int."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
-        r = await self.client.post(self.url, json=payload)
-        return int(r.json()["result"], 16)
+        data = await self._post_json(payload)
+        if "error" in data:
+            e = data["error"]
+            raise RuntimeError(f"RPC error: {e.get('code')} {e.get('message')}")
+        return int(data["result"], 16)
 
     async def get_logs(
         self,
@@ -79,12 +115,9 @@ class RPC(IEvmLogsProvider):
                 "topics": topics_param(topic0s),
             }
         ]
-        r = await self.client.post(
-            self.url,
-            json={"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params},
+        data = await self._post_json(
+            {"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params},
         )
-        r.raise_for_status()
-        data = r.json()
         if "error" in data:
             e = data["error"]
             raise RuntimeError(f"RPC error: {e.get('code')} {e.get('message')}")

@@ -18,12 +18,14 @@ from defind.core.use_cases.fetch_decode import (
     FetchDecodeConfig,
     FetchDecodeService,
     ProcessStats,
+    WorkSeed,
     build_work_seeds,
 )
 from defind.decoding.registry import EventRegistryProvider
 from defind.decoding.specs import EventRegistry
 from defind.clients.rpc import RPC
-from defind.orchestration.utils import load_done_coverage
+from defind.orchestration.utils import load_done_chunks, merge_intervals
+from defind.storage.chunks import chunk_key
 from defind.storage.local import LocalChunkStorage
 from defind.storage.s3 import S3ChunkStorage
 
@@ -102,6 +104,58 @@ def _merge_stats(total: ProcessStats, delta: ProcessStats) -> None:
     total.chunks_written += delta.chunks_written
 
 
+def _plan_seeds_with_tail_extension(
+    *,
+    current_start: int,
+    current_end: int,
+    chunk_size: int,
+    done_chunks: list[tuple[int, int]],
+) -> tuple[list[WorkSeed], tuple[int, int] | None]:
+    """Plan work seeds and optionally extend the latest partial chunk."""
+    if current_start > current_end:
+        return [], None
+
+    covered = merge_intervals(done_chunks)
+    seed_start = current_start
+    old_tail_to_replace: tuple[int, int] | None = None
+
+    if done_chunks:
+        tail = max(done_chunks, key=lambda iv: iv[1])
+        ta, tb = tail
+        tail_len = tb - ta + 1
+        target_tail_end = min(ta + chunk_size - 1, current_end)
+        if tail_len < chunk_size and target_tail_end > tb:
+            old_tail_to_replace = tail
+            seed_start = min(current_start, ta)
+            covered = merge_intervals([iv for iv in done_chunks if iv != tail])
+
+    seeds = build_work_seeds(
+        start=seed_start,
+        end=current_end,
+        chunk_size=chunk_size,
+        covered=covered,
+    )
+    return seeds, old_tail_to_replace
+
+
+def _has_extended_tail_seed(
+    seeds: list[WorkSeed],
+    old_tail: tuple[int, int],
+) -> bool:
+    ta, tb = old_tail
+    return any(s.start == ta and s.end > tb for s in seeds)
+
+
+def _delete_old_chunk_interval(
+    storage: IChunkStorage,
+    event_names: list[str],
+    interval: tuple[int, int],
+) -> None:
+    a, b = interval
+    for ev in event_names:
+        storage.delete(chunk_key(ev, a, b))
+
+
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
@@ -127,6 +181,8 @@ async def fetch_decode(
         config.rpc_url,
         timeout_s=config.timeout_s,
         max_connections=max(32, 2 * config.concurrency),
+        max_retries=config.rpc_max_retries,
+        retry_backoff_s=config.rpc_retry_backoff_s,
     )
 
     storage, contract_dir = _build_storage(config)
@@ -141,6 +197,7 @@ async def fetch_decode(
             chunk_size=effective_chunk_size,
             concurrency=config.concurrency,
             codec=config.codec,
+            print_chunk_writes=config.print_chunk_writes,
         )
 
         service = FetchDecodeService(
@@ -154,12 +211,12 @@ async def fetch_decode(
         current_end = end
 
         while True:
-            covered = load_done_coverage(storage, event_names)
-            seeds = build_work_seeds(
-                start=current_start,
-                end=current_end,
+            done_chunks = load_done_chunks(storage, event_names)
+            seeds, old_tail_to_replace = _plan_seeds_with_tail_extension(
+                current_start=current_start,
+                current_end=current_end,
                 chunk_size=effective_chunk_size,
-                covered=covered,
+                done_chunks=done_chunks,
             )
             delta_stats = await service.run(
                 config=domain_config,
@@ -167,6 +224,12 @@ async def fetch_decode(
                 seeds=seeds,
             )
             _merge_stats(total_stats, delta_stats)
+
+            if (
+                old_tail_to_replace is not None
+                and _has_extended_tail_seed(seeds, old_tail_to_replace)
+            ):
+                _delete_old_chunk_interval(storage, event_names, old_tail_to_replace)
 
             if not config.listen:
                 break

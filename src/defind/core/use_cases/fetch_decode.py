@@ -36,6 +36,7 @@ class FetchDecodeConfig:
     chunk_size: int
     concurrency: int
     codec: str = "lz4"
+    print_chunk_writes: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ class ProcessContext:
     event_names: list[str]
     step: int
     codec: str
+    print_chunk_writes: bool
     stats: ProcessStats
 
 
@@ -94,6 +96,10 @@ class WorkSeed:
 
 class RPCFetchError(RuntimeError):
     """Raised when an RPC log fetch fails for a block interval."""
+
+    def __init__(self, message: str, *, splitable: bool) -> None:
+        super().__init__(message)
+        self.splitable = splitable
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +211,11 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
     try:
         results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
     except Exception as e:
-        raise RPCFetchError(f"RPC fetch failed for interval [{a}, {b}]") from e
+        splitable = isinstance(e, RuntimeError) and str(e).startswith("RPC error:")
+        raise RPCFetchError(
+            f"RPC fetch failed for interval [{a}, {b}]",
+            splitable=splitable,
+        ) from e
     ctx.stats.executed_subranges += len(sub_ranges)
     return [log for batch in results for log in batch]
 
@@ -220,8 +230,6 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
 
     Each seed produces exactly one Parquet per event type.
     Internally, the range is fetched using step-sized concurrent sub-calls.
-    The Parquet write runs in a thread pool (asyncio.to_thread) so it does
-    not block the event loop during compression.
     On RPC fetch failures, the range splits in half and both halves retry.
     Decode/write failures are raised immediately.
     """
@@ -237,7 +245,10 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
 
         try:
             logs = await _fetch_chunk_logs(ctx, a, b)
-        except RPCFetchError:
+        except RPCFetchError as e:
+            if not e.splitable:
+                ctx.stats.processed_failed += 1
+                raise
             children = current.split()
             if children is None:
                 ctx.stats.processed_failed += 1
@@ -249,9 +260,17 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
             continue
 
         buffers = _decode_logs(logs, ctx.registry)
-        written = await asyncio.to_thread(
-            write_chunk, ctx.storage, ctx.registry, a, b, buffers, ctx.codec
+        written = write_chunk(
+            ctx.storage, ctx.registry, a, b, buffers, ctx.codec
         )
+
+        if ctx.print_chunk_writes:
+            print(
+                f"[defind] chunk_written interval=[{a},{b}] logs={len(logs)} files={len(written)}",
+                flush=True,
+            )
+            for key in written:
+                print(f"[defind]   -> {key}", flush=True)
 
         ctx.stats.total_logs += len(logs)
         ctx.stats.processed_ok += 1
@@ -301,6 +320,7 @@ class FetchDecodeService:
             event_names=event_names,
             step=config.step,
             codec=config.codec,
+            print_chunk_writes=config.print_chunk_writes,
             stats=stats,
         )
 

@@ -98,3 +98,10 @@ class S3ChunkStorage(IChunkStorage):
                 rel = info.path.removeprefix(full_prefix)
                 keys.append(rel)
         return keys
+
+    def delete(self, key: str) -> None:
+        s3_path = self._s3_path(key)
+        try:
+            self._fs.delete_file(s3_path)
+        except Exception:
+            pass
