@@ -6,6 +6,15 @@ Each processed block interval produces exactly one Parquet file per event type:
 Empty files (0 rows) are written for event types with no events in a given
 range. This makes every written chunk file a reliable "done" marker, enabling
 unambiguous resume logic based solely on file presence.
+
+Data format
+-----------
+`write_chunk` accepts per-event columnar buffers:
+    buffers: dict[event_name → {field_name → list_of_values}]
+
+Each event buffer contains the base fields (block_number, block_timestamp,
+tx_hash, log_index, contract) plus the event's own projection keys.
+No padding — each event buffer only tracks its own fields.
 """
 
 from __future__ import annotations
@@ -13,11 +22,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from defind.core.interfaces import IChunkStorage
-from defind.core.models import BASE_FIELDS, Column
+from defind.core.models import BASE_FIELDS
 from defind.decoding.specs import EventRegistry, EventSpec
+
+# Sort order applied to every written table
+_SORT_KEYS = [
+    ("block_number", "ascending"),
+    ("tx_hash", "ascending"),
+    ("log_index", "ascending"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -54,15 +69,14 @@ def parse_chunk_key(key: str) -> tuple[int, int] | None:
 
 
 # ---------------------------------------------------------------------------
-# Empty table builder
+# Arrow table builders
 # ---------------------------------------------------------------------------
 
 
 def empty_table_for_spec(spec: EventSpec) -> pa.Table:
     """Build an empty Arrow table with the correct schema for an event spec.
 
-    Includes base columns (block_number, tx_hash, ...) plus all dynamic
-    projection columns defined by the spec, all with 0 rows.
+    Includes base columns plus all projection columns, all with 0 rows.
     """
     fields = [pa.field(name, dtype) for name, dtype in BASE_FIELDS]
     arrays: dict[str, pa.Array] = {
@@ -73,6 +87,29 @@ def empty_table_for_spec(spec: EventSpec) -> pa.Table:
         arrays[col_name] = pa.array([], type=pa.string())
     schema = pa.schema(fields)
     return pa.Table.from_pydict(arrays, schema=schema)
+
+
+def _build_table(ev_buf: dict[str, list], spec: EventSpec) -> pa.Table:
+    """Build a sorted Arrow table directly from a per-event columnar buffer.
+
+    ev_buf contains base fields + projection keys as plain Python lists.
+    No intermediate Column object — Arrow arrays are built in one pass.
+    """
+    n = len(ev_buf["block_number"])
+    fields = [pa.field(name, dtype) for name, dtype in BASE_FIELDS]
+    arrays: dict[str, pa.Array] = {
+        "block_number":    pa.array(ev_buf["block_number"],    type=pa.uint64()),
+        "block_timestamp": pa.array(ev_buf["block_timestamp"], type=pa.uint64()),
+        "tx_hash":         pa.array(ev_buf["tx_hash"],         type=pa.string()),
+        "log_index":       pa.array(ev_buf["log_index"],       type=pa.uint64()),
+        "contract":        pa.array(ev_buf["contract"],        type=pa.string()),
+        "event":           pa.array([spec.name] * n,           type=pa.string()),
+    }
+    for out_key in sorted(spec.projection.keys()):
+        fields.append(pa.field(out_key, pa.string()))
+        arrays[out_key] = pa.array(ev_buf.get(out_key, [None] * n), type=pa.string())
+    schema = pa.schema(fields)
+    return pa.Table.from_pydict(arrays, schema=schema).sort_by(_SORT_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -108,35 +145,26 @@ def write_chunk(
     registry: EventRegistry,
     from_block: int,
     to_block: int,
-    col: Column,
-    codec: str = "zstd",
+    buffers: dict[str, dict[str, list]],
+    codec: str = "lz4",
 ) -> list[str]:
     """Write one Parquet file per event type for this block range.
 
-    For each event in the registry:
-    - Extracts rows for this event type from `col`.
-    - If 0 rows: writes an empty Parquet with the correct schema.
-    - Writes to storage under key: `{EventName}/chunk_{from:010d}_{to:010d}.parquet`
+    `buffers` maps event_name → {field_name → list_of_values}.
+    Each buffer contains only the fields for that event (no padding).
 
-    Returns the list of written keys.
+    For each event in the registry:
+    - If rows exist: builds an Arrow table directly and writes it.
+    - If 0 rows: writes an empty Parquet with the correct schema.
+
+    Returns the list of written storage keys.
     """
     written: list[str] = []
 
-    # Build a fast index: event_name → row indices
-    idx_by_event: dict[str, list[int]] = {}
-    for i, ev in enumerate(col.event):
-        idx_by_event.setdefault(ev, []).append(i)
-
     for spec in registry.values():
-        ev_name = spec.name
-        key = chunk_key(ev_name, from_block, to_block)
-
-        indices = idx_by_event.get(ev_name)
-        if indices:
-            table = col.take_indices(indices).to_arrow_table()
-        else:
-            table = empty_table_for_spec(spec)
-
+        key = chunk_key(spec.name, from_block, to_block)
+        ev_buf = buffers.get(spec.name)
+        table = _build_table(ev_buf, spec) if ev_buf else empty_table_for_spec(spec)
         storage.write_table(key, table, codec)
         written.append(key)
 

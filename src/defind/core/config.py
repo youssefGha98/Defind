@@ -23,6 +23,9 @@ class OrchestratorConfig:
                                    # None → même valeur que step (1 fichier par step)
     concurrency: int = 16
     timeout_s: int = 20
+    codec: str = "lz4"            # compression Parquet ("lz4", "zstd", "snappy", "none")
+    listen: bool = False          # continue polling after backfill
+    listen_poll_interval_s: float = 2.0
 
     # Local storage (used when s3_bucket is None)
     out_root: Path = Path("./data")
@@ -35,18 +38,3 @@ class OrchestratorConfig:
     s3_secret_key: str | None = None
     s3_region: str = "auto"
 
-
-@dataclass(frozen=True)
-class RawFetchConfig:
-    """Configuration for the raw log fetcher (CLI)."""
-
-    rpc_url: str
-    contract: str
-    events: list[str]
-    from_block: int
-    to_block: int
-    step: int = 1_000
-    concurrency: int = 16
-    jsonl_out: str = ""
-    manifest_path: str = ""
-    rerun_failed: bool = False

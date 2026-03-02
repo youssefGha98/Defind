@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from defind.core.interfaces import IEvmLogsProvider, IChunkStorage, IEventRegistryProvider
-from defind.core.models import Column, EventLog, Meta
+from defind.core.models import EventLog, Meta
 from defind.decoding.decoder import decode_event
 from defind.decoding.specs import EventRegistry
 from defind.orchestration.utils import iter_chunks, subtract_iv
@@ -27,6 +27,7 @@ class FetchDecodeConfig:
     step       — RPC fetch granularity (blocks per eth_getLogs call).
     chunk_size — Output Parquet granularity (blocks per output file).
                  Must be a multiple of step. Defaults to step when not set.
+    codec      — Parquet compression codec ("lz4", "zstd", "snappy", "none").
     """
 
     address: str
@@ -34,6 +35,7 @@ class FetchDecodeConfig:
     step: int
     chunk_size: int
     concurrency: int
+    codec: str = "lz4"
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ class ProcessContext:
     storage: IChunkStorage
     event_names: list[str]
     step: int
+    codec: str
     stats: ProcessStats
 
 
@@ -79,12 +82,18 @@ class WorkSeed:
     start: int
     end: int
 
-    def split(self) -> tuple[WorkSeed, WorkSeed]:
+    def split(self) -> tuple[WorkSeed, WorkSeed] | None:
+        if self.start >= self.end:
+            return None
         mid = (self.start + self.end) // 2
         return (
             WorkSeed(self.start, mid),
             WorkSeed(mid + 1, self.end)
         )
+
+
+class RPCFetchError(RuntimeError):
+    """Raised when an RPC log fetch fails for a block interval."""
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +123,17 @@ def build_work_seeds(
 # ---------------------------------------------------------------------------
 
 
-def _decode_logs(logs: list[EventLog], registry: EventRegistry) -> Column:
-    """Decode all logs into a Column buffer. Filtered logs are silently skipped."""
-    col = Column.empty()
+def _decode_logs(
+    logs: list[EventLog],
+    registry: EventRegistry,
+) -> dict[str, dict[str, list]]:
+    """Decode all logs into per-event columnar buffers.
+
+    Returns a dict mapping event_name → {field_name → list_of_values}.
+    Each event type only tracks its own fields — no padding.
+    Filtered logs are silently skipped.
+    """
+    buffers: dict[str, dict[str, list]] = {}
 
     for ev in logs:
         if not ev.topics:
@@ -142,14 +159,28 @@ def _decode_logs(logs: list[EventLog], registry: EventRegistry) -> Column:
         if pe is None:
             continue
 
-        col.append_from_parsed(
-            pe_name=pe.name,
-            meta=meta,
-            values=pe.values,
-            contract_addr=pe.pool,
-        )
+        ev_buf = buffers.get(pe.name)
+        if ev_buf is None:
+            ev_buf = {
+                "block_number": [],
+                "block_timestamp": [],
+                "tx_hash": [],
+                "log_index": [],
+                "contract": [],
+            }
+            for out_key in pe.values:
+                ev_buf[out_key] = []
+            buffers[pe.name] = ev_buf
 
-    return col
+        ev_buf["block_number"].append(meta.block_number)
+        ev_buf["block_timestamp"].append(int(meta.block_timestamp or 0))
+        ev_buf["tx_hash"].append(meta.tx_hash)
+        ev_buf["log_index"].append(meta.log_index)
+        ev_buf["contract"].append(pe.pool)
+        for out_key, v in pe.values.items():
+            ev_buf[out_key].append(None if v is None else str(v))
+
+    return buffers
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +202,10 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
                 to_block=to_b,
             )
 
-    results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
+    try:
+        results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
+    except Exception as e:
+        raise RPCFetchError(f"RPC fetch failed for interval [{a}, {b}]") from e
     ctx.stats.executed_subranges += len(sub_ranges)
     return [log for batch in results for log in batch]
 
@@ -186,7 +220,10 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
 
     Each seed produces exactly one Parquet per event type.
     Internally, the range is fetched using step-sized concurrent sub-calls.
-    On any failure (RPC error etc.) the range splits in half and both halves retry.
+    The Parquet write runs in a thread pool (asyncio.to_thread) so it does
+    not block the event loop during compression.
+    On RPC fetch failures, the range splits in half and both halves retry.
+    Decode/write failures are raised immediately.
     """
     stack: list[WorkSeed] = [seed]
 
@@ -200,19 +237,25 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
 
         try:
             logs = await _fetch_chunk_logs(ctx, a, b)
-            ctx.stats.total_logs += len(logs)
-
-            col = _decode_logs(logs, ctx.registry)
-            written = write_chunk(ctx.storage, ctx.registry, a, b, col)
-
-            ctx.stats.processed_ok += 1
-            ctx.stats.chunks_written += len(written)
-
-        except Exception:
-            left, right = current.split()
+        except RPCFetchError:
+            children = current.split()
+            if children is None:
+                ctx.stats.processed_failed += 1
+                raise
+            left, right = children
             stack.extend([left, right])
             ctx.stats.partially_covered_split += 1
             ctx.stats.processed_failed += 1
+            continue
+
+        buffers = _decode_logs(logs, ctx.registry)
+        written = await asyncio.to_thread(
+            write_chunk, ctx.storage, ctx.registry, a, b, buffers, ctx.codec
+        )
+
+        ctx.stats.total_logs += len(logs)
+        ctx.stats.processed_ok += 1
+        ctx.stats.chunks_written += len(written)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +300,7 @@ class FetchDecodeService:
             storage=storage,
             event_names=event_names,
             step=config.step,
+            codec=config.codec,
             stats=stats,
         )
 

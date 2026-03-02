@@ -4,7 +4,7 @@ from typing import List, Protocol, runtime_checkable
 
 import pyarrow as pa
 
-from defind.core.models import EventLog, Column
+from defind.core.models import EventLog
 
 
 # ---------------------------------------------------------------------------

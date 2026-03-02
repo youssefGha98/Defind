@@ -34,7 +34,6 @@ class LocalChunkStorage(IChunkStorage):
         tmp_path = out_path.with_suffix(".tmp")
         pq.write_table(table, tmp_path, compression=codec)
         os.replace(tmp_path, out_path)
-        print(f"wrote {out_path}  (rows={len(table)})")
 
     def exists(self, key: str) -> bool:
         return self._full_path(key).exists()

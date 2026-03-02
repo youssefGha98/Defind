@@ -8,6 +8,7 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,6 +93,15 @@ def _build_storage(config: OrchestratorConfig) -> tuple[IChunkStorage, str]:
     return storage, contract_dir
 
 
+def _merge_stats(total: ProcessStats, delta: ProcessStats) -> None:
+    total.processed_ok += delta.processed_ok
+    total.processed_failed += delta.processed_failed
+    total.executed_subranges += delta.executed_subranges
+    total.total_logs += delta.total_logs
+    total.partially_covered_split += delta.partially_covered_split
+    total.chunks_written += delta.chunks_written
+
+
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
@@ -108,6 +118,7 @@ async def fetch_decode(
     - Builds storage backend (local or S3).
     - Loads coverage from existing chunk files.
     - Runs fetch → decode → write for uncovered ranges.
+    - If `config.listen=True`, continues polling for new blocks after backfill.
     """
     registry_provider = EventRegistryProvider(registry)
     event_names = [spec.name for spec in registry.values()]
@@ -121,10 +132,6 @@ async def fetch_decode(
     storage, contract_dir = _build_storage(config)
 
     try:
-        start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
-
-        covered = load_done_coverage(storage, event_names)
-
         effective_chunk_size = config.chunk_size if config.chunk_size is not None else config.step
 
         domain_config = FetchDecodeConfig(
@@ -133,27 +140,46 @@ async def fetch_decode(
             step=config.step,
             chunk_size=effective_chunk_size,
             concurrency=config.concurrency,
-        )
-
-        seeds = build_work_seeds(
-            start=start,
-            end=end,
-            chunk_size=effective_chunk_size,
-            covered=covered,
+            codec=config.codec,
         )
 
         service = FetchDecodeService(
             logs_provider=rpc,
             registry_provider=registry_provider,
         )
+        total_stats = ProcessStats()
 
-        stats = await service.run(
-            config=domain_config,
-            storage=storage,
-            seeds=seeds,
-        )
+        start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
+        current_start = start
+        current_end = end
+
+        while True:
+            covered = load_done_coverage(storage, event_names)
+            seeds = build_work_seeds(
+                start=current_start,
+                end=current_end,
+                chunk_size=effective_chunk_size,
+                covered=covered,
+            )
+            delta_stats = await service.run(
+                config=domain_config,
+                storage=storage,
+                seeds=seeds,
+            )
+            _merge_stats(total_stats, delta_stats)
+
+            if not config.listen:
+                break
+
+            current_start = current_end + 1
+            while True:
+                latest = await rpc.latest_block()
+                if latest >= current_start:
+                    current_end = latest
+                    break
+                await asyncio.sleep(config.listen_poll_interval_s)
 
     finally:
         await rpc.aclose()
 
-    return FetchDecodeOutput(stats=stats, contract_dir=contract_dir)
+    return FetchDecodeOutput(stats=total_stats, contract_dir=contract_dir)

@@ -1,18 +1,10 @@
-"""Core data models, configurations, and constants.
+"""Core data models and configurations."""
 
-This package provides:
-- Data models (EventLog, Column, Meta)
-- Configuration classes (OrchestratorConfig, RawFetchConfig)
-- Event topic constants
-"""
-
-from defind.core.config import OrchestratorConfig, RawFetchConfig
-from defind.core.models import Column, EventLog, Meta
+from defind.core.config import OrchestratorConfig
+from defind.core.models import EventLog, Meta
 
 __all__ = [
     "OrchestratorConfig",
-    "RawFetchConfig",
-    "Column",
     "EventLog",
     "Meta",
 ]
