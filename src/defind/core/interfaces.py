@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import pyarrow as pa
 
 from defind.core.models import EventLog
-
 
 # ---------------------------------------------------------------------------
 # IEvmLogsProvider
@@ -28,7 +27,7 @@ class IEvmLogsProvider(Protocol):
         topic0s: list[str],
         from_block: int,
         to_block: int,
-    ) -> List[EventLog]:
+    ) -> list[EventLog]:
         ...
 
     async def latest_block(self) -> int:
@@ -88,4 +87,12 @@ class IChunkStorage(Protocol):
 
     def delete(self, key: str) -> None:
         """Delete a key if present (best effort for idempotent maintenance)."""
+        ...
+
+    def write_json(self, key: str, payload: dict) -> None:
+        """Write a JSON payload to a relative key."""
+        ...
+
+    def read_json(self, key: str) -> dict | None:
+        """Read a JSON payload from a relative key, or None if missing/invalid."""
         ...

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import List, Tuple
 
-from defind.core.interfaces import IEvmLogsProvider, IChunkStorage, IEventRegistryProvider
+import httpx
+
+from defind.core.interfaces import IChunkStorage, IEventRegistryProvider, IEvmLogsProvider
 from defind.core.models import EventLog, Meta
 from defind.decoding.decoder import decode_event
 from defind.decoding.specs import EventRegistry
 from defind.orchestration.utils import iter_chunks, subtract_iv
 from defind.storage.chunks import chunk_is_done, write_chunk
-
 
 # ---------------------------------------------------------------------------
 # Domain configuration
@@ -75,6 +75,7 @@ class ProcessContext:
     step: int
     codec: str
     print_chunk_writes: bool
+    force_reprocess: bool
     stats: ProcessStats
 
 
@@ -102,6 +103,45 @@ class RPCFetchError(RuntimeError):
         self.splitable = splitable
 
 
+_RANGE_ERROR_MARKERS = (
+    "more than",
+    "too many",
+    "max results",
+    "response size",
+    "request entity too large",
+    "block range",
+    "query returned",
+)
+
+
+def _looks_range_limited_message(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(marker in msg for marker in _RANGE_ERROR_MARKERS)
+
+
+def _is_splitable_rpc_exception(exc: Exception) -> bool:
+    # JSON-RPC structured errors from the RPC client.
+    if isinstance(exc, RuntimeError) and str(exc).startswith("RPC error:"):
+        msg = str(exc).lower()
+        return ("-32005" in msg) or _looks_range_limited_message(msg)
+
+    # Some providers return HTTP errors instead of JSON-RPC errors.
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 413:
+            return True
+        if status in (400, 414):
+            body = ""
+            try:
+                body = exc.response.text
+            except Exception:
+                pass
+            return _looks_range_limited_message(body) or _looks_range_limited_message(str(exc))
+        return False
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Work seeds builder
 # ---------------------------------------------------------------------------
@@ -111,8 +151,8 @@ def build_work_seeds(
     start: int,
     end: int,
     chunk_size: int,
-    covered: List[Tuple[int, int]],
-) -> List[WorkSeed]:
+    covered: list[tuple[int, int]],
+) -> list[WorkSeed]:
     """Build a list of uncovered block intervals to process.
 
     Each WorkSeed spans `chunk_size` blocks and produces one output Parquet.
@@ -211,7 +251,7 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
     try:
         results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
     except Exception as e:
-        splitable = isinstance(e, RuntimeError) and str(e).startswith("RPC error:")
+        splitable = _is_splitable_rpc_exception(e)
         raise RPCFetchError(
             f"RPC fetch failed for interval [{a}, {b}]",
             splitable=splitable,
@@ -233,6 +273,11 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
     On RPC fetch failures, the range splits in half and both halves retry.
     Decode/write failures are raised immediately.
     """
+    if seed.start < 0 or seed.end < 0:
+        raise ValueError("seed bounds must be >= 0")
+    if seed.start > seed.end:
+        raise ValueError("seed.start must be <= seed.end")
+
     stack: list[WorkSeed] = [seed]
 
     while stack:
@@ -240,7 +285,7 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         a, b = current.start, current.end
 
         # Skip if already written (handles both resume and retry-after-split)
-        if chunk_is_done(ctx.storage, ctx.event_names, a, b):
+        if (not ctx.force_reprocess) and chunk_is_done(ctx.storage, ctx.event_names, a, b):
             continue
 
         try:
@@ -293,14 +338,34 @@ class FetchDecodeService:
         self._logs_provider = logs_provider
         self._registry_provider = registry_provider
 
+    @staticmethod
+    def _validate_inputs(config: FetchDecodeConfig, seeds: list[WorkSeed]) -> None:
+        if config.step <= 0:
+            raise ValueError("step must be > 0")
+        if config.chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+        if config.concurrency <= 0:
+            raise ValueError("concurrency must be > 0")
+        if not config.address:
+            raise ValueError("address must not be empty")
+        if not config.topic0s:
+            raise ValueError("topic0s must not be empty")
+        for s in seeds:
+            if s.start < 0 or s.end < 0:
+                raise ValueError("seed bounds must be >= 0")
+            if s.start > s.end:
+                raise ValueError("seed.start must be <= seed.end")
+
     async def run(
         self,
         *,
         config: FetchDecodeConfig,
         storage: IChunkStorage,
         seeds: list[WorkSeed],
+        force_reprocess: bool = False,
     ) -> ProcessStats:
         """Execute the decoding process over the given block seeds."""
+        self._validate_inputs(config, seeds)
         stats = ProcessStats()
 
         if not seeds:
@@ -321,13 +386,24 @@ class FetchDecodeService:
             step=config.step,
             codec=config.codec,
             print_chunk_writes=config.print_chunk_writes,
+            force_reprocess=force_reprocess,
             stats=stats,
         )
 
-        tasks = [
-            asyncio.create_task(process_interval(ctx, seed))
-            for seed in seeds
-        ]
+        worker_count = min(len(seeds), max(1, config.concurrency))
+        seed_iter = iter(seeds)
+        seed_lock = asyncio.Lock()
+
+        async def _worker() -> None:
+            while True:
+                async with seed_lock:
+                    try:
+                        seed = next(seed_iter)
+                    except StopIteration:
+                        return
+                await process_interval(ctx, seed)
+
+        tasks = [asyncio.create_task(_worker()) for _ in range(worker_count)]
         await asyncio.gather(*tasks)
 
         return stats

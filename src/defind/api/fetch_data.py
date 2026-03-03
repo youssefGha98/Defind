@@ -3,8 +3,8 @@ from __future__ import annotations
 from defind.core.config import OrchestratorConfig
 from defind.decoding.specs import EventRegistry
 from defind.orchestration.orchestrator import (
-    fetch_decode,
     FetchDecodeOutput,
+    fetch_decode,
 )
 
 

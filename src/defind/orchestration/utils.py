@@ -13,16 +13,12 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from dataclasses import dataclass
-from pathlib import Path
 
 from defind.core.interfaces import IChunkStorage
 from defind.storage.chunks import parse_chunk_key
 
-
-def topics_fingerprint(t0s: list[str]) -> str:
-    """Compact fingerprint for a set of topic0 signatures (order-insensitive)."""
-    uniq = sorted({(t or "").lower() for t in t0s if t})
-    return "x".join(x[:10] for x in uniq) if uniq else "none"
+_COVERAGE_INDEX_KEY = "_meta/coverage_index.json"
+_COVERAGE_INDEX_VERSION = 1
 
 
 def iter_chunks(a: int, b: int, step: int) -> Generator[tuple[int, int], None, None]:
@@ -161,6 +157,56 @@ def load_done_chunks(
     return sorted(done)
 
 
+def load_done_chunks_from_index(
+    storage: IChunkStorage,
+    event_names: list[str],
+) -> list[tuple[int, int]] | None:
+    """Load done chunks from persisted coverage index if compatible."""
+    data = storage.read_json(_COVERAGE_INDEX_KEY)
+    if not isinstance(data, dict):
+        return None
+
+    if data.get("version") != _COVERAGE_INDEX_VERSION:
+        return None
+
+    expected_events = sorted(event_names)
+    indexed_events = data.get("event_names")
+    if not isinstance(indexed_events, list) or sorted(indexed_events) != expected_events:
+        return None
+
+    raw_chunks = data.get("done_chunks")
+    if not isinstance(raw_chunks, list):
+        return None
+
+    parsed: list[tuple[int, int]] = []
+    try:
+        for iv in raw_chunks:
+            if not (isinstance(iv, list) and len(iv) == 2):
+                return None
+            a, b = int(iv[0]), int(iv[1])
+            if a > b:
+                return None
+            parsed.append((a, b))
+    except Exception:
+        return None
+
+    return sorted(set(parsed))
+
+
+def save_done_chunks_to_index(
+    storage: IChunkStorage,
+    event_names: list[str],
+    done_chunks: list[tuple[int, int]],
+) -> None:
+    """Persist done chunks as a compact JSON index."""
+    payload = {
+        "version": _COVERAGE_INDEX_VERSION,
+        "event_names": sorted(event_names),
+        "done_chunks": [[a, b] for a, b in sorted(set(done_chunks))],
+    }
+    storage.write_json(_COVERAGE_INDEX_KEY, payload)
+
+
 @dataclass(frozen=True)
 class RangeCompletion:
     """Completion report for a requested inclusive block range."""
@@ -191,10 +237,3 @@ def check_range_completion(
         covered=covered,
         missing=missing,
     )
-
-
-def to_hex_block(block: int | str) -> str:
-    """Convert block number to hex string if integer, else return as is."""
-    if isinstance(block, int):
-        return hex(block)
-    return block

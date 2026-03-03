@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -54,3 +55,20 @@ class LocalChunkStorage(IChunkStorage):
             path.unlink()
         except FileNotFoundError:
             pass
+
+    def write_json(self, key: str, payload: dict) -> None:
+        out_path = self._full_path(key)
+        out_path.parent.mkdir(exist_ok=True, parents=True)
+        tmp_path = out_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, out_path)
+
+    def read_json(self, key: str) -> dict | None:
+        path = self._full_path(key)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None

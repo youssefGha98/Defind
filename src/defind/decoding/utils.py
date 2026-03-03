@@ -33,10 +33,13 @@ def parse_data_word(word: bytes, typ: str) -> Any:
     if typ.startswith("uint"):
         return int.from_bytes(word, "big", signed=False)
     if typ.startswith("int"):
-        # Handle signed integers using two's complement conversion
-        v = int.from_bytes(word, "big", signed=False)
+        # Handle signed integers using two's complement conversion.
         bits = int(typ[3:]) if typ != "int" else 256
-        # Convert to signed if value exceeds positive range
+        if bits <= 0 or bits > 256:
+            raise ValueError(f"invalid signed integer width: {typ}")
+        v = int.from_bytes(word, "big", signed=False)
+        if bits < 256:
+            v &= (1 << bits) - 1
         if v >= 2 ** (bits - 1):
             v -= 2**bits
         return v

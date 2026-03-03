@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from defind.decoding.specs import EventRegistry, EventSpec
 from defind.core.interfaces import IEventRegistryProvider
+from defind.decoding.specs import EventRegistry, EventSpec
 
 
 def make_registry() -> EventRegistry:

@@ -28,6 +28,7 @@ class OrchestratorConfig:
     codec: str = "lz4"            # compression Parquet ("lz4", "zstd", "snappy", "none")
     listen: bool = False          # continue polling after backfill
     listen_poll_interval_s: float = 2.0
+    reorg_lookback_blocks: int = 0  # in listen mode, reprocess the last N blocks when a new block arrives
     print_chunk_writes: bool = False  # print each written chunk key/interval
 
     # Local storage (used when s3_bucket is None)

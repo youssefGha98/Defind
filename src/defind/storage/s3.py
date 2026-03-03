@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+import json
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -30,9 +30,9 @@ class S3ChunkStorage(IChunkStorage):
         *,
         bucket: str,
         prefix: str = "",
-        endpoint_url: Optional[str] = None,
-        access_key: Optional[str] = None,
-        secret_key: Optional[str] = None,
+        endpoint_url: str | None = None,
+        access_key: str | None = None,
+        secret_key: str | None = None,
         region: str = "auto",
     ) -> None:
         """
@@ -105,3 +105,22 @@ class S3ChunkStorage(IChunkStorage):
             self._fs.delete_file(s3_path)
         except Exception:
             pass
+
+    def write_json(self, key: str, payload: dict) -> None:
+        s3_path = self._s3_path(key)
+        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        with self._fs.open_output_stream(s3_path) as out:
+            out.write(raw)
+
+    def read_json(self, key: str) -> dict | None:
+        s3_path = self._s3_path(key)
+        try:
+            info = self._fs.get_file_info(s3_path)
+            if info.type != pa_fs.FileType.File:
+                return None
+            with self._fs.open_input_file(s3_path) as inp:
+                raw = inp.read()
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
