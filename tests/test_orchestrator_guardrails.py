@@ -11,10 +11,17 @@ from defind.core.config import OrchestratorConfig
 from defind.core.use_cases.fetch_decode import WorkSeed
 from defind.decoding.specs import DataFieldSpec, EventRegistry, EventSpec, ProjectionRefs, TopicFieldSpec
 from defind.orchestration.orchestrator import (
+    _acquire_writer_lock,
     _build_storage,
     _cleanup_overlapping_intervals,
     _cleanup_redundant_old_chunks,
+    _heartbeat_loop,
+    _load_done_chunks_with_index_fallback,
     _plan_startup_small_interval_compaction,
+    _ProgressState,
+    _raise_if_writer_lock_lost,
+    _refresh_writer_lock,
+    _release_writer_lock,
     _resolve_block_range,
     _safe_save_done_chunks_index,
     _select_reorg_rewrite_seeds,
@@ -54,6 +61,27 @@ def _make_registry() -> EventRegistry:
     registry: EventRegistry = {}
     registry[spec.topic0] = spec
     return registry
+
+
+class _MemJsonStorage:
+    def __init__(self) -> None:
+        self._json: dict[str, dict] = {}
+
+    def write_json(self, key: str, payload: dict) -> None:
+        self._json[key] = dict(payload)
+
+    def read_json(self, key: str) -> dict | None:
+        val = self._json.get(key)
+        return None if val is None else dict(val)
+
+    def exists(self, key: str) -> bool:
+        return key in self._json
+
+    def delete(self, key: str) -> None:
+        self._json.pop(key, None)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        return []
 
 
 @pytest.mark.asyncio
@@ -100,6 +128,26 @@ def test_validate_runtime_config_guardrails() -> None:
     with pytest.raises(ValueError, match="contract_slug must not have leading/trailing spaces"):
         _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
 
+    cfg = _base_config(heartbeat_interval_s=-1)
+    with pytest.raises(ValueError, match="heartbeat_interval_s must be >= 0"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(lag_warn_threshold_blocks=-1)
+    with pytest.raises(ValueError, match="lag_warn_threshold_blocks must be >= 0"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(writer_lock_ttl_s=0)
+    with pytest.raises(ValueError, match="writer_lock_ttl_s must be > 0"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(writer_lock_refresh_s=0.0)
+    with pytest.raises(ValueError, match="writer_lock_refresh_s must be > 0"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(writer_lock_ttl_s=20, writer_lock_refresh_s=20.0)
+    with pytest.raises(ValueError, match="writer_lock_refresh_s must be < writer_lock_ttl_s"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
 
 def test_build_storage_local_and_s3() -> None:
     local_cfg = _base_config(out_root=Path("/tmp/local-root"))
@@ -139,6 +187,93 @@ def test_safe_save_done_chunks_index_swallows_storage_errors() -> None:
     storage = MagicMock()
     storage.write_json.side_effect = RuntimeError("disk full")
     _safe_save_done_chunks_index(storage, ["Event"], [(0, 1)])
+
+
+def test_writer_lock_acquire_refresh_release() -> None:
+    storage = _MemJsonStorage()
+    lock = _acquire_writer_lock(
+        storage=storage,
+        key="_meta/writer.lock.json",
+        owner_id="owner-a",
+        run_id="run-a",
+        ttl_s=120,
+    )
+    assert storage.exists("_meta/writer.lock.json") is True
+    _refresh_writer_lock(storage=storage, lock=lock)
+    _release_writer_lock(storage=storage, lock=lock)
+    assert storage.exists("_meta/writer.lock.json") is False
+
+
+def test_writer_lock_rejects_active_other_owner() -> None:
+    storage = _MemJsonStorage()
+    storage.write_json(
+        "_meta/writer.lock.json",
+        {
+            "owner_id": "owner-a",
+            "run_id": "run-a",
+            "acquired_at_s": 0,
+            "refreshed_at_s": 0,
+            "expires_at_s": 4_000_000_000,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="already held"):
+        _acquire_writer_lock(
+            storage=storage,
+            key="_meta/writer.lock.json",
+            owner_id="owner-b",
+            run_id="run-b",
+            ttl_s=120,
+        )
+
+
+def test_writer_lock_refresh_detects_owner_loss() -> None:
+    storage = _MemJsonStorage()
+    lock = _acquire_writer_lock(
+        storage=storage,
+        key="_meta/writer.lock.json",
+        owner_id="owner-a",
+        run_id="run-a",
+        ttl_s=120,
+    )
+    storage.write_json(
+        "_meta/writer.lock.json",
+        {
+            "owner_id": "owner-b",
+            "run_id": "run-b",
+            "acquired_at_s": 0,
+            "refreshed_at_s": 0,
+            "expires_at_s": 4_000_000_000,
+        },
+    )
+    with pytest.raises(RuntimeError, match="writer lock lost"):
+        _refresh_writer_lock(storage=storage, lock=lock)
+
+
+def test_raise_if_writer_lock_lost_raises() -> None:
+    with pytest.raises(RuntimeError, match="writer lock lost during run"):
+        _raise_if_writer_lock_lost([RuntimeError("boom")])
+
+
+def test_load_done_chunks_with_index_fallback_uses_index_on_scan_error() -> None:
+    storage = MagicMock()
+    with (
+        patch("defind.orchestration.orchestrator.load_done_chunks", side_effect=RuntimeError("s3 unavailable")),
+        patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=[(0, 99)]),
+    ):
+        chunks, source = _load_done_chunks_with_index_fallback(storage, ["Event"])
+    assert chunks == [(0, 99)]
+    assert source == "index"
+
+
+def test_load_done_chunks_with_index_fallback_raises_when_no_index() -> None:
+    storage = MagicMock()
+    with (
+        patch("defind.orchestration.orchestrator.load_done_chunks", side_effect=RuntimeError("s3 unavailable")),
+        patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=None),
+    ):
+        with pytest.raises(RuntimeError, match="s3 unavailable"):
+            _load_done_chunks_with_index_fallback(storage, ["Event"])
 
 
 def test_cleanup_redundant_old_chunks_no_seeds_is_noop() -> None:
@@ -201,6 +336,72 @@ async def test_fetch_decode_invalid_runtime_config_still_closes_rpc(mock_rpc: An
         with pytest.raises(ValueError, match="topic0s must not be empty"):
             await fetch_decode(
                 config=_base_config(topic0s=[]),
+                registry=registry,
+            )
+
+    mock_rpc.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_aborts_when_chunk_scan_fails_without_index(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    storage = MagicMock()
+    storage.list_keys.side_effect = RuntimeError("s3 list timeout")
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(storage, "/tmp/test/pool")),
+        patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=None),
+    ):
+        with pytest.raises(RuntimeError, match="s3 list timeout"):
+            await fetch_decode(
+                config=_base_config(),
+                registry=registry,
+            )
+
+    mock_rpc.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_uses_index_when_chunk_scan_fails(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    storage = MagicMock()
+    storage.list_keys.side_effect = RuntimeError("s3 list timeout")
+    service = MagicMock()
+    service.run = AsyncMock()
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(storage, "/tmp/test/pool")),
+        patch("defind.orchestration.orchestrator.FetchDecodeService", return_value=service),
+        patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=[(0, 100)]),
+    ):
+        await fetch_decode(
+            config=_base_config(start_block=0, end_block=100),
+            registry=registry,
+        )
+
+    service.run.assert_not_awaited()
+    mock_rpc.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_single_writer_guard_blocks_other_owner(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    storage = MagicMock()
+    storage.exists.return_value = True
+    storage.read_json.return_value = {
+        "owner_id": "another-owner",
+        "expires_at_s": 4_000_000_000,
+    }
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(storage, "/tmp/test/pool")),
+    ):
+        with pytest.raises(RuntimeError, match="already held"):
+            await fetch_decode(
+                config=_base_config(single_writer_guard=True),
                 registry=registry,
             )
 
@@ -325,3 +526,38 @@ async def test_fetch_decode_listen_with_no_seeds_does_not_call_service(mock_rpc:
             )
 
     service.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_writes_json_and_warns_on_lag_threshold() -> None:
+    storage = MagicMock()
+    progress = _ProgressState(
+        mode="listen_wait",
+        start_block=0,
+        target_end_block=120,
+        last_indexed_block=90,
+        chain_head_block=120,
+    )
+
+    with (
+        patch(
+            "defind.orchestration.orchestrator.asyncio.sleep",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+        patch("defind.orchestration.orchestrator.logger.warning") as warning_mock,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await _heartbeat_loop(
+                storage=storage,
+                key="_meta/heartbeat.json",
+                interval_s=30.0,
+                lag_warn_threshold_blocks=20,
+                progress=progress,
+            )
+
+    storage.write_json.assert_called_once()
+    payload = storage.write_json.call_args.args[1]
+    assert payload["last_indexed_block"] == 90
+    assert payload["chain_head_block"] == 120
+    assert payload["lag_blocks"] == 30
+    assert warning_mock.call_count >= 1

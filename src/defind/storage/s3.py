@@ -1,12 +1,41 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
+from typing import TypeVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow import fs as pa_fs
 
 from defind.core.interfaces import IChunkStorage
+from defind.observability import get_logger
+
+logger = get_logger(__name__)
+T = TypeVar("T")
+_RETRYABLE_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "network is unreachable",
+    "temporarily unavailable",
+    "service unavailable",
+    "slow down",
+    "throttl",
+    "too many requests",
+    "internalerror",
+    "503",
+    "500",
+    "429",
+)
+_NOT_FOUND_MARKERS = (
+    "not found",
+    "no such file",
+    "does not exist",
+    "404",
+)
 
 
 class S3ChunkStorage(IChunkStorage):
@@ -34,6 +63,8 @@ class S3ChunkStorage(IChunkStorage):
         access_key: str | None = None,
         secret_key: str | None = None,
         region: str = "auto",
+        max_retries: int = 3,
+        retry_backoff_s: float = 0.5,
     ) -> None:
         """
         Parameters
@@ -55,6 +86,8 @@ class S3ChunkStorage(IChunkStorage):
         """
         self.bucket = bucket
         self.prefix = prefix.rstrip("/") + "/" if prefix else ""
+        self._max_retries = max(0, int(max_retries))
+        self._retry_backoff_s = max(0.0, float(retry_backoff_s))
 
         fs_kwargs: dict = {"region": region}
         if endpoint_url:
@@ -65,30 +98,101 @@ class S3ChunkStorage(IChunkStorage):
 
         self._fs = pa_fs.S3FileSystem(**fs_kwargs)
 
+    def _is_retryable_exception(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        if any(marker in msg for marker in _RETRYABLE_MARKERS):
+            return True
+        if isinstance(exc, (TimeoutError, OSError)):
+            return True
+        arrow_io_error = getattr(pa, "ArrowIOError", None)
+        if arrow_io_error is not None and isinstance(exc, arrow_io_error):
+            return True
+        return False
+
+    @staticmethod
+    def _is_not_found_exception(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(marker in msg for marker in _NOT_FOUND_MARKERS)
+
+    def _with_retries(self, op_name: str, fn: Callable[[], T]) -> T:
+        attempt = 0
+        delay = self._retry_backoff_s
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if (attempt >= self._max_retries) or (not self._is_retryable_exception(exc)):
+                    raise
+                logger.warning(
+                    "s3_retry op=%s attempt=%d/%d err=%s retry_in_s=%.2f",
+                    op_name,
+                    attempt + 1,
+                    self._max_retries + 1,
+                    exc,
+                    delay,
+                    extra={
+                        "op": op_name,
+                        "attempt": attempt + 1,
+                        "max_attempts": self._max_retries + 1,
+                        "error": str(exc),
+                        "retry_in_s": delay,
+                    },
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                    delay = min(delay * 2, 8.0)
+                attempt += 1
+
     def _s3_path(self, key: str) -> str:
         return f"{self.bucket}/{self.prefix}{key}"
 
     def write_table(self, key: str, table: pa.Table, codec: str) -> None:
         s3_path = self._s3_path(key)
-        pq.write_table(table, s3_path, compression=codec, filesystem=self._fs)
-        print(f"wrote s3://{s3_path}  (rows={len(table)})")
+        self._with_retries(
+            "write_table",
+            lambda: pq.write_table(table, s3_path, compression=codec, filesystem=self._fs),
+        )
+        logger.debug(
+            "s3_chunk_written path=s3://%s rows=%d",
+            s3_path,
+            len(table),
+            extra={"path": f"s3://{s3_path}", "rows": len(table)},
+        )
 
     def exists(self, key: str) -> bool:
         s3_path = self._s3_path(key)
         try:
-            info = self._fs.get_file_info(s3_path)
+            info = self._with_retries("exists", lambda: self._fs.get_file_info(s3_path))
             return info.type == pa_fs.FileType.File
-        except Exception:
-            return False
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return False
+            logger.error(
+                "s3_exists_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+                exc_info=True,
+            )
+            raise
 
     def list_keys(self, prefix: str) -> list[str]:
         """List all .parquet keys under `self.prefix + prefix`."""
         s3_prefix_path = f"{self.bucket}/{self.prefix}{prefix}"
         selector = pa_fs.FileSelector(s3_prefix_path, recursive=True)
         try:
-            file_infos = self._fs.get_file_info(selector)
-        except Exception:
-            return []
+            file_infos = self._with_retries("list_keys", lambda: self._fs.get_file_info(selector))
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return []
+            logger.error(
+                "s3_list_keys_failed path=s3://%s err=%s",
+                s3_prefix_path,
+                exc,
+                extra={"path": f"s3://{s3_prefix_path}", "error": str(exc)},
+                exc_info=True,
+            )
+            raise
 
         keys = []
         full_prefix = f"{self.bucket}/{self.prefix}"
@@ -102,25 +206,40 @@ class S3ChunkStorage(IChunkStorage):
     def delete(self, key: str) -> None:
         s3_path = self._s3_path(key)
         try:
-            self._fs.delete_file(s3_path)
-        except Exception:
-            pass
+            self._with_retries("delete", lambda: self._fs.delete_file(s3_path))
+        except Exception as exc:
+            logger.warning(
+                "s3_delete_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
 
     def write_json(self, key: str, payload: dict) -> None:
         s3_path = self._s3_path(key)
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        with self._fs.open_output_stream(s3_path) as out:
-            out.write(raw)
+        def _do_write() -> None:
+            with self._fs.open_output_stream(s3_path) as out:
+                out.write(raw)
+        self._with_retries("write_json", _do_write)
 
     def read_json(self, key: str) -> dict | None:
         s3_path = self._s3_path(key)
         try:
-            info = self._fs.get_file_info(s3_path)
+            info = self._with_retries("read_json_info", lambda: self._fs.get_file_info(s3_path))
             if info.type != pa_fs.FileType.File:
                 return None
-            with self._fs.open_input_file(s3_path) as inp:
-                raw = inp.read()
+            def _read_raw() -> bytes:
+                with self._fs.open_input_file(s3_path) as inp:
+                    return inp.read()
+            raw = self._with_retries("read_json", _read_raw)
             data = json.loads(raw.decode("utf-8"))
             return data if isinstance(data, dict) else None
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "s3_read_json_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
             return None

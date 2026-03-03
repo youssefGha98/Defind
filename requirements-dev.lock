@@ -66,6 +66,8 @@ defusedxml==0.7.1
     # via nbconvert
 distlib==0.4.0
     # via virtualenv
+dotenv==0.9.9
+    # via defind
 duckdb==1.4.2
     # via defind
 eth-abi==5.2.0
@@ -294,6 +296,8 @@ python-dateutil==2.9.0.post0
     # via ghp-import
     # via jupyter-client
     # via pandas
+python-dotenv==1.2.2
+    # via dotenv
 python-json-logger==4.0.0
     # via jupyter-events
 pytz==2025.2

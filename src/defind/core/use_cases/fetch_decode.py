@@ -9,8 +9,11 @@ from defind.core.interfaces import IChunkStorage, IEventRegistryProvider, IEvmLo
 from defind.core.models import EventLog, Meta
 from defind.decoding.decoder import decode_event
 from defind.decoding.specs import EventRegistry
+from defind.observability import get_logger
 from defind.orchestration.utils import iter_chunks, subtract_iv
 from defind.storage.chunks import chunk_is_done, write_chunk
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Domain configuration
@@ -293,15 +296,45 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         except RPCFetchError as e:
             if not e.splitable:
                 ctx.stats.processed_failed += 1
+                logger.error(
+                    "chunk_fetch_failed",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "splitable": False,
+                    },
+                    exc_info=True,
+                )
                 raise
             children = current.split()
             if children is None:
                 ctx.stats.processed_failed += 1
+                logger.error(
+                    "chunk_fetch_failed",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "splitable": True,
+                        "reason": "single_block_unrecoverable",
+                    },
+                    exc_info=True,
+                )
                 raise
             left, right = children
             stack.extend([left, right])
             ctx.stats.partially_covered_split += 1
             ctx.stats.processed_failed += 1
+            logger.warning(
+                "chunk_split_retry",
+                extra={
+                    "chunk_start": a,
+                    "chunk_end": b,
+                    "left_start": left.start,
+                    "left_end": left.end,
+                    "right_start": right.start,
+                    "right_end": right.end,
+                },
+            )
             continue
 
         buffers = _decode_logs(logs, ctx.registry)
@@ -310,12 +343,24 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         )
 
         if ctx.print_chunk_writes:
-            print(
-                f"[defind] chunk_written interval=[{a},{b}] logs={len(logs)} files={len(written)}",
-                flush=True,
+            logger.info(
+                "chunk_written",
+                extra={
+                    "chunk_start": a,
+                    "chunk_end": b,
+                    "logs": len(logs),
+                    "files": len(written),
+                },
             )
             for key in written:
-                print(f"[defind]   -> {key}", flush=True)
+                logger.info(
+                    "chunk_file_written",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "chunk_key": key,
+                    },
+                )
 
         ctx.stats.total_logs += len(logs)
         ctx.stats.processed_ok += 1

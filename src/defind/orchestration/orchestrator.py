@@ -9,6 +9,11 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import socket
+import time
+import uuid
 from dataclasses import dataclass
 
 from defind.clients.rpc import RPC
@@ -23,6 +28,7 @@ from defind.core.use_cases.fetch_decode import (
 )
 from defind.decoding.registry import EventRegistryProvider
 from defind.decoding.specs import EventRegistry
+from defind.observability import bind_log_context, configure_logging, get_logger
 from defind.orchestration.utils import (
     load_done_chunks,
     load_done_chunks_from_index,
@@ -34,6 +40,8 @@ from defind.storage.chunks import chunk_key, parse_chunk_key
 from defind.storage.local import LocalChunkStorage
 from defind.storage.s3 import S3ChunkStorage
 
+logger = get_logger(__name__)
+
 # ---------------------------------------------------------------------------
 # Output DTO
 # ---------------------------------------------------------------------------
@@ -44,6 +52,249 @@ class FetchDecodeOutput:
     """High-level output of the orchestrator."""
     stats: ProcessStats
     contract_dir: str   # root key/path for all chunks of this contract
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _ProgressState:
+    """Shared mutable progress state consumed by the heartbeat loop."""
+
+    mode: str
+    start_block: int
+    target_end_block: int
+    last_indexed_block: int
+    chain_head_block: int | None
+
+
+@dataclass(slots=True)
+class _WriterLock:
+    """Lease lock used to prevent concurrent writers on one dataset."""
+
+    key: str
+    owner_id: str
+    run_id: str
+    ttl_s: int
+    acquired_at_s: int
+
+
+def _last_indexed_block(done_chunks: list[tuple[int, int]], *, start: int) -> int:
+    if not done_chunks:
+        return start - 1
+    return max(end for _, end in done_chunks)
+
+
+async def _heartbeat_loop(
+    *,
+    storage: IChunkStorage,
+    key: str,
+    interval_s: float,
+    lag_warn_threshold_blocks: int,
+    progress: _ProgressState,
+) -> None:
+    while True:
+        lag_blocks: int | None = None
+        if progress.chain_head_block is not None:
+            lag_blocks = max(0, progress.chain_head_block - progress.last_indexed_block)
+
+        payload = {
+            "ts_unix_s": int(time.time()),
+            "mode": progress.mode,
+            "start_block": progress.start_block,
+            "target_end_block": progress.target_end_block,
+            "last_indexed_block": progress.last_indexed_block,
+            "chain_head_block": progress.chain_head_block,
+            "lag_blocks": lag_blocks,
+        }
+
+        try:
+            storage.write_json(key, payload)
+        except Exception as exc:
+            logger.warning(
+                "heartbeat_write_failed",
+                extra={
+                    "heartbeat_key": key,
+                    "error": str(exc),
+                },
+            )
+
+        base_extra = {
+            "heartbeat_key": key,
+            "mode": progress.mode,
+            "last_indexed_block": progress.last_indexed_block,
+            "chain_head_block": progress.chain_head_block,
+            "lag_blocks": lag_blocks,
+        }
+        if (
+            lag_blocks is not None
+            and lag_warn_threshold_blocks > 0
+            and lag_blocks > lag_warn_threshold_blocks
+        ):
+            logger.warning("heartbeat_lag_high", extra=base_extra)
+        else:
+            logger.info("heartbeat", extra=base_extra)
+
+        await asyncio.sleep(interval_s)
+
+
+def _read_writer_lock(storage: IChunkStorage, key: str) -> dict | None:
+    exists = storage.exists(key)
+    if not exists:
+        return None
+    data = storage.read_json(key)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"writer lock exists but is unreadable key={key}")
+    return data
+
+
+def _lock_expiry(lock_payload: dict) -> int:
+    try:
+        return int(lock_payload.get("expires_at_s", 0))
+    except Exception:
+        return 0
+
+
+def _acquire_writer_lock(
+    *,
+    storage: IChunkStorage,
+    key: str,
+    owner_id: str,
+    run_id: str,
+    ttl_s: int,
+) -> _WriterLock:
+    now = int(time.time())
+    current = _read_writer_lock(storage, key)
+    if current is not None:
+        current_owner = str(current.get("owner_id") or "")
+        expires_at = _lock_expiry(current)
+        if current_owner and current_owner != owner_id and expires_at > now:
+            raise RuntimeError(
+                f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}"
+            )
+
+    payload = {
+        "version": 1,
+        "owner_id": owner_id,
+        "run_id": run_id,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "acquired_at_s": now,
+        "refreshed_at_s": now,
+        "expires_at_s": now + ttl_s,
+    }
+    storage.write_json(key, payload)
+    check = _read_writer_lock(storage, key)
+    if not isinstance(check, dict) or str(check.get("owner_id") or "") != owner_id:
+        observed = None if not isinstance(check, dict) else check.get("owner_id")
+        raise RuntimeError(
+            f"failed to acquire writer lock key={key}; observed_owner={observed}"
+        )
+
+    return _WriterLock(
+        key=key,
+        owner_id=owner_id,
+        run_id=run_id,
+        ttl_s=ttl_s,
+        acquired_at_s=now,
+    )
+
+
+def _refresh_writer_lock(
+    *,
+    storage: IChunkStorage,
+    lock: _WriterLock,
+) -> None:
+    now = int(time.time())
+    current = _read_writer_lock(storage, lock.key)
+    if not isinstance(current, dict):
+        raise RuntimeError(f"writer lock disappeared key={lock.key}")
+
+    current_owner = str(current.get("owner_id") or "")
+    if current_owner != lock.owner_id:
+        raise RuntimeError(
+            f"writer lock lost key={lock.key}; owner={current_owner} expected={lock.owner_id}"
+        )
+
+    payload = {
+        "version": 1,
+        "owner_id": lock.owner_id,
+        "run_id": lock.run_id,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "acquired_at_s": int(current.get("acquired_at_s") or lock.acquired_at_s),
+        "refreshed_at_s": now,
+        "expires_at_s": now + lock.ttl_s,
+    }
+    storage.write_json(lock.key, payload)
+    check = _read_writer_lock(storage, lock.key)
+    if not isinstance(check, dict) or str(check.get("owner_id") or "") != lock.owner_id:
+        observed = None if not isinstance(check, dict) else check.get("owner_id")
+        raise RuntimeError(
+            f"writer lock verification failed key={lock.key}; observed_owner={observed}"
+        )
+
+
+def _release_writer_lock(
+    *,
+    storage: IChunkStorage,
+    lock: _WriterLock,
+) -> None:
+    try:
+        current = _read_writer_lock(storage, lock.key)
+    except Exception as exc:
+        logger.warning(
+            "writer_lock_release_read_failed",
+            extra={"writer_lock_key": lock.key, "error": str(exc)},
+        )
+        return
+
+    if not isinstance(current, dict):
+        return
+    current_owner = str(current.get("owner_id") or "")
+    if current_owner != lock.owner_id:
+        return
+
+    try:
+        storage.delete(lock.key)
+    except Exception as exc:
+        logger.warning(
+            "writer_lock_release_delete_failed",
+            extra={"writer_lock_key": lock.key, "error": str(exc)},
+        )
+
+
+async def _writer_lock_refresh_loop(
+    *,
+    storage: IChunkStorage,
+    lock: _WriterLock,
+    refresh_interval_s: float,
+    lock_errors: list[Exception],
+) -> None:
+    while True:
+        try:
+            _refresh_writer_lock(storage=storage, lock=lock)
+            logger.debug(
+                "writer_lock_refreshed",
+                extra={"writer_lock_key": lock.key, "writer_owner_id": lock.owner_id},
+            )
+        except Exception as exc:
+            lock_errors.append(exc)
+            logger.error(
+                "writer_lock_refresh_failed",
+                extra={"writer_lock_key": lock.key, "writer_owner_id": lock.owner_id, "error": str(exc)},
+                exc_info=True,
+            )
+            return
+        await asyncio.sleep(refresh_interval_s)
+
+
+def _raise_if_writer_lock_lost(lock_errors: list[Exception]) -> None:
+    if not lock_errors:
+        return
+    raise RuntimeError("writer lock lost during run") from lock_errors[0]
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +355,8 @@ def _build_storage(config: OrchestratorConfig) -> tuple[IChunkStorage, str]:
             access_key=config.s3_access_key,
             secret_key=config.s3_secret_key,
             region=config.s3_region,
+            max_retries=config.s3_max_retries,
+            retry_backoff_s=config.s3_retry_backoff_s,
         )
         contract_dir = f"s3://{config.s3_bucket}/{prefix}"
     else:
@@ -143,6 +396,26 @@ def _validate_runtime_config(*, config: OrchestratorConfig, effective_chunk_size
         raise ValueError("listen_poll_interval_s must be >= 0")
     if config.reorg_lookback_blocks < 0:
         raise ValueError("reorg_lookback_blocks must be >= 0")
+    if config.s3_max_retries < 0:
+        raise ValueError("s3_max_retries must be >= 0")
+    if config.s3_retry_backoff_s < 0:
+        raise ValueError("s3_retry_backoff_s must be >= 0")
+    if config.heartbeat_interval_s < 0:
+        raise ValueError("heartbeat_interval_s must be >= 0")
+    if config.lag_warn_threshold_blocks < 0:
+        raise ValueError("lag_warn_threshold_blocks must be >= 0")
+    if not config.heartbeat_key or not config.heartbeat_key.strip():
+        raise ValueError("heartbeat_key must not be empty")
+    if not config.writer_lock_key or not config.writer_lock_key.strip():
+        raise ValueError("writer_lock_key must not be empty")
+    if config.writer_lock_ttl_s <= 0:
+        raise ValueError("writer_lock_ttl_s must be > 0")
+    if config.writer_lock_refresh_s <= 0:
+        raise ValueError("writer_lock_refresh_s must be > 0")
+    if config.writer_lock_refresh_s >= config.writer_lock_ttl_s:
+        raise ValueError("writer_lock_refresh_s must be < writer_lock_ttl_s")
+    if not config.log_level or not config.log_level.strip():
+        raise ValueError("log_level must not be empty")
     if not config.address or not config.address.strip():
         raise ValueError("address must not be empty")
     if not config.topic0s:
@@ -271,7 +544,16 @@ def _cleanup_redundant_old_chunks(
             orphan_intervals.add((oa, ob))
 
     for ev in event_names:
-        for key in storage.list_keys(f"{ev}/"):
+        try:
+            keys = storage.list_keys(f"{ev}/")
+        except Exception as exc:
+            # Non-critical maintenance path: keep running if backend listing is transiently unavailable.
+            logger.warning(
+                "cleanup_redundant_scan_failed",
+                extra={"event_name": ev, "error": str(exc)},
+            )
+            continue
+        for key in keys:
             parsed = parse_chunk_key(key)
             if parsed is not None:
                 oa, ob = parsed
@@ -300,7 +582,15 @@ def _cleanup_overlapping_intervals(
     deleted: set[tuple[int, int]] = set()
     for ev in event_names:
         candidates: set[tuple[int, int]] = set()
-        for key in storage.list_keys(f"{ev}/"):
+        try:
+            keys = storage.list_keys(f"{ev}/")
+        except Exception as exc:
+            logger.warning(
+                "cleanup_overlaps_scan_failed",
+                extra={"event_name": ev, "error": str(exc)},
+            )
+            return []
+        for key in keys:
             parsed = parse_chunk_key(key)
             if parsed is not None:
                 candidates.add(parsed)
@@ -347,9 +637,29 @@ def _safe_save_done_chunks_index(
 ) -> None:
     try:
         save_done_chunks_to_index(storage, event_names, done_chunks)
-    except Exception:
+    except Exception as exc:
         # Coverage index is a cache hint: never fail the pipeline on index write issues.
-        pass
+        logger.warning("coverage_index_write_failed", extra={"error": str(exc)})
+
+
+def _load_done_chunks_with_index_fallback(
+    storage: IChunkStorage,
+    event_names: list[str],
+) -> tuple[list[tuple[int, int]], str]:
+    """Load done chunks from scan, with index fallback when scan backend fails."""
+    try:
+        scanned = load_done_chunks(storage, event_names)
+        return scanned, "scan"
+    except Exception as exc:
+        indexed = load_done_chunks_from_index(storage, event_names)
+        if indexed is None:
+            logger.error("done_chunk_scan_failed_no_index", extra={"error": str(exc)}, exc_info=True)
+            raise
+        logger.warning(
+            "done_chunk_scan_failed_using_index",
+            extra={"error": str(exc), "indexed_chunk_count": len(indexed)},
+        )
+        return indexed, "index"
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +699,10 @@ async def fetch_decode(
     if len(set(event_names)) != len(event_names):
         raise ValueError("registry event names must be unique")
 
+    configure_logging(level=config.log_level, json_logs=config.log_json)
+    run_id = uuid.uuid4().hex
+    dataset_id = f"{config.protocol_slug}/{config.contract_slug}"
+
     rpc = RPC(
         config.rpc_url,
         timeout_s=config.timeout_s,
@@ -397,147 +711,302 @@ async def fetch_decode(
         retry_backoff_s=config.rpc_retry_backoff_s,
     )
 
-    storage, contract_dir = _build_storage(config)
+    heartbeat_task: asyncio.Task | None = None
+    writer_lock: _WriterLock | None = None
+    writer_lock_task: asyncio.Task | None = None
+    writer_lock_errors: list[Exception] = []
+    storage: IChunkStorage | None = None
+    total_stats = ProcessStats()
+    contract_dir = ""
 
-    try:
-        effective_chunk_size = config.chunk_size if config.chunk_size is not None else config.step
-        _validate_runtime_config(config=config, effective_chunk_size=effective_chunk_size)
+    with bind_log_context(run_id=run_id, dataset_id=dataset_id):
+        try:
+            storage, contract_dir = _build_storage(config)
+            effective_chunk_size = config.chunk_size if config.chunk_size is not None else config.step
+            _validate_runtime_config(config=config, effective_chunk_size=effective_chunk_size)
 
-        domain_config = FetchDecodeConfig(
-            address=config.address,
-            topic0s=config.topic0s,
-            step=config.step,
-            chunk_size=effective_chunk_size,
-            concurrency=config.concurrency,
-            codec=config.codec,
-            print_chunk_writes=config.print_chunk_writes,
-        )
+            if config.single_writer_guard:
+                owner_id = f"{socket.gethostname()}:{os.getpid()}:{run_id}"
+                writer_lock = _acquire_writer_lock(
+                    storage=storage,
+                    key=config.writer_lock_key,
+                    owner_id=owner_id,
+                    run_id=run_id,
+                    ttl_s=config.writer_lock_ttl_s,
+                )
+                logger.info(
+                    "writer_lock_acquired",
+                    extra={
+                        "writer_lock_key": writer_lock.key,
+                        "writer_owner_id": writer_lock.owner_id,
+                        "writer_ttl_s": writer_lock.ttl_s,
+                    },
+                )
+                writer_lock_task = asyncio.create_task(
+                    _writer_lock_refresh_loop(
+                        storage=storage,
+                        lock=writer_lock,
+                        refresh_interval_s=config.writer_lock_refresh_s,
+                        lock_errors=writer_lock_errors,
+                    )
+                )
 
-        service = FetchDecodeService(
-            logs_provider=rpc,
-            registry_provider=registry_provider,
-        )
-        total_stats = ProcessStats()
-
-        start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
-        current_start = start
-        current_end = end
-
-        # Startup consistency check: files are the source of truth.
-        scanned_done_chunks = load_done_chunks(storage, event_names)
-        indexed_done_chunks = load_done_chunks_from_index(storage, event_names)
-        if indexed_done_chunks is None or indexed_done_chunks != scanned_done_chunks:
-            done_chunks_state = scanned_done_chunks
-            _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
-        else:
-            done_chunks_state = indexed_done_chunks
-
-        # One-shot compaction of legacy overlaps created by interrupted runs.
-        deleted_contained = _cleanup_overlapping_intervals(
-            storage=storage,
-            event_names=event_names,
-        )
-        if deleted_contained:
-            done_chunks_state = load_done_chunks(storage, event_names)
-            _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
-
-        # Startup compaction: if a merged covered range is < chunk_size but split
-        # across multiple files, rewrite it as one interval before normal planning.
-        startup_compaction_seeds = _plan_startup_small_interval_compaction(
-            anchor_start=start,
-            chunk_size=effective_chunk_size,
-            done_chunks=done_chunks_state,
-        )
-        if startup_compaction_seeds:
-            delta_stats = await service.run(
-                config=domain_config,
-                storage=storage,
-                seeds=startup_compaction_seeds,
-                force_reprocess=True,
+            domain_config = FetchDecodeConfig(
+                address=config.address,
+                topic0s=config.topic0s,
+                step=config.step,
+                chunk_size=effective_chunk_size,
+                concurrency=config.concurrency,
+                codec=config.codec,
+                print_chunk_writes=config.print_chunk_writes,
             )
-            _merge_stats(total_stats, delta_stats)
-            _cleanup_redundant_old_chunks(
+
+            service = FetchDecodeService(
+                logs_provider=rpc,
+                registry_provider=registry_provider,
+            )
+
+            start, end = await _resolve_block_range(rpc, config.start_block, config.end_block)
+            current_start = start
+            current_end = end
+
+            progress = _ProgressState(
+                mode="backfill",
+                start_block=start,
+                target_end_block=end,
+                last_indexed_block=start - 1,
+                chain_head_block=(
+                    end
+                    if isinstance(config.end_block, str) and config.end_block.lower() == "latest"
+                    else None
+                ),
+            )
+
+            if config.heartbeat_interval_s > 0:
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(
+                        storage=storage,
+                        key=config.heartbeat_key,
+                        interval_s=config.heartbeat_interval_s,
+                        lag_warn_threshold_blocks=config.lag_warn_threshold_blocks,
+                        progress=progress,
+                    )
+                )
+
+            logger.info(
+                "indexer_started",
+                extra={
+                    "contract_dir": contract_dir,
+                    "listen_mode": config.listen,
+                    "start_block": start,
+                    "end_block": end,
+                    "chunk_size": effective_chunk_size,
+                    "step": config.step,
+                    "concurrency": config.concurrency,
+                },
+            )
+
+            # Startup consistency check: files are the source of truth.
+            scanned_done_chunks, startup_source = _load_done_chunks_with_index_fallback(storage, event_names)
+            indexed_done_chunks = load_done_chunks_from_index(storage, event_names)
+            if startup_source == "scan":
+                if indexed_done_chunks is None or indexed_done_chunks != scanned_done_chunks:
+                    done_chunks_state = scanned_done_chunks
+                    _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
+                    logger.warning(
+                        "coverage_index_stale_or_missing",
+                        extra={
+                            "indexed_chunk_count": 0 if indexed_done_chunks is None else len(indexed_done_chunks),
+                            "scanned_chunk_count": len(scanned_done_chunks),
+                        },
+                    )
+                else:
+                    done_chunks_state = indexed_done_chunks
+            else:
+                done_chunks_state = scanned_done_chunks
+
+            progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
+
+            # One-shot compaction of legacy overlaps created by interrupted runs.
+            deleted_contained = _cleanup_overlapping_intervals(
                 storage=storage,
                 event_names=event_names,
-                old_done_chunks=done_chunks_state,
-                seeds=startup_compaction_seeds,
             )
-            done_chunks_state = load_done_chunks(storage, event_names)
-            _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
-
-        is_backfill_pass = True
-        seen_batch_plans: set[tuple[tuple[int, int], ...]] = set()
-        while True:
-            done_chunks_state = load_done_chunks(storage, event_names)
-
-            if config.listen and (not is_backfill_pass) and config.reorg_lookback_blocks > 0:
-                window_start = max(start, current_end - config.reorg_lookback_blocks + 1)
-                reorg_seeds = _select_reorg_rewrite_seeds(
-                    done_chunks=done_chunks_state,
-                    window_start=window_start,
-                    window_end=current_end,
+            if deleted_contained:
+                logger.warning(
+                    "legacy_overlap_cleanup",
+                    extra={"deleted_intervals": len(deleted_contained)},
                 )
-                if reorg_seeds:
-                    delta_stats = await service.run(
-                        config=domain_config,
-                        storage=storage,
-                        seeds=reorg_seeds,
-                        force_reprocess=True,
-                    )
-                    _merge_stats(total_stats, delta_stats)
+                done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
+                _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
+                progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
 
-                    done_chunks_state = load_done_chunks(storage, event_names)
-                    _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
-
-            seeds = _plan_seeds_with_tail_extension(
-                current_start=current_start,
-                current_end=current_end,
+            # Startup compaction: if a merged covered range is < chunk_size but split
+            # across multiple files, rewrite it as one interval before normal planning.
+            startup_compaction_seeds = _plan_startup_small_interval_compaction(
+                anchor_start=start,
                 chunk_size=effective_chunk_size,
                 done_chunks=done_chunks_state,
             )
-
-            if not config.listen:
-                if not seeds:
-                    break
-                plan_key = tuple((s.start, s.end) for s in seeds)
-                if plan_key in seen_batch_plans:
-                    break
-                seen_batch_plans.add(plan_key)
-
-            if seeds:
+            if startup_compaction_seeds:
+                logger.info(
+                    "startup_compaction_planned",
+                    extra={"seed_count": len(startup_compaction_seeds)},
+                )
                 delta_stats = await service.run(
                     config=domain_config,
                     storage=storage,
-                    seeds=seeds,
-                    force_reprocess=False,
+                    seeds=startup_compaction_seeds,
+                    force_reprocess=True,
                 )
                 _merge_stats(total_stats, delta_stats)
                 _cleanup_redundant_old_chunks(
                     storage=storage,
                     event_names=event_names,
                     old_done_chunks=done_chunks_state,
-                    seeds=seeds,
+                    seeds=startup_compaction_seeds,
                 )
-                # The file scan is the source of truth (covers split writes and concurrent writers).
-                done_chunks_state = load_done_chunks(storage, event_names)
+                done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
                 _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
+                progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
 
-            if not config.listen:
-                # Keep iterating in batch mode until no more backfill/compaction seeds.
-                continue
-
-            next_min_block = current_end + 1
+            is_backfill_pass = True
+            seen_batch_plans: set[tuple[tuple[int, int], ...]] = set()
             while True:
-                latest = await rpc.latest_block()
-                if latest >= next_min_block:
-                    current_end = latest
-                    current_start = next_min_block
-                    break
-                await asyncio.sleep(config.listen_poll_interval_s)
+                _raise_if_writer_lock_lost(writer_lock_errors)
+                done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
+                progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
 
-            is_backfill_pass = False
+                if config.listen and (not is_backfill_pass) and config.reorg_lookback_blocks > 0:
+                    window_start = max(start, current_end - config.reorg_lookback_blocks + 1)
+                    reorg_seeds = _select_reorg_rewrite_seeds(
+                        done_chunks=done_chunks_state,
+                        window_start=window_start,
+                        window_end=current_end,
+                    )
+                    if reorg_seeds:
+                        logger.warning(
+                            "reorg_rewrite_planned",
+                            extra={
+                                "window_start": window_start,
+                                "window_end": current_end,
+                                "seed_count": len(reorg_seeds),
+                            },
+                        )
+                        delta_stats = await service.run(
+                            config=domain_config,
+                            storage=storage,
+                            seeds=reorg_seeds,
+                            force_reprocess=True,
+                        )
+                        _merge_stats(total_stats, delta_stats)
 
-    finally:
-        await rpc.aclose()
+                        done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
+                        _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
+                        progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
+
+                seeds = _plan_seeds_with_tail_extension(
+                    current_start=current_start,
+                    current_end=current_end,
+                    chunk_size=effective_chunk_size,
+                    done_chunks=done_chunks_state,
+                )
+
+                if not config.listen:
+                    if not seeds:
+                        break
+                    plan_key = tuple((s.start, s.end) for s in seeds)
+                    if plan_key in seen_batch_plans:
+                        logger.warning("plan_cycle_guard_triggered", extra={"seed_count": len(seeds)})
+                        break
+                    seen_batch_plans.add(plan_key)
+
+                if seeds:
+                    logger.info(
+                        "seed_batch_start",
+                        extra={
+                            "seed_count": len(seeds),
+                            "first_seed_start": seeds[0].start,
+                            "last_seed_end": seeds[-1].end,
+                            "force_reprocess": False,
+                        },
+                    )
+                    delta_stats = await service.run(
+                        config=domain_config,
+                        storage=storage,
+                        seeds=seeds,
+                        force_reprocess=False,
+                    )
+                    _merge_stats(total_stats, delta_stats)
+                    _cleanup_redundant_old_chunks(
+                        storage=storage,
+                        event_names=event_names,
+                        old_done_chunks=done_chunks_state,
+                        seeds=seeds,
+                    )
+                    # The file scan is the source of truth (covers split writes and concurrent writers).
+                    done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
+                    _safe_save_done_chunks_index(storage, event_names, done_chunks_state)
+                    progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
+
+                if not config.listen:
+                    # Keep iterating in batch mode until no more backfill/compaction seeds.
+                    continue
+
+                next_min_block = current_end + 1
+                progress.mode = "listen_wait"
+                while True:
+                    _raise_if_writer_lock_lost(writer_lock_errors)
+                    latest = await rpc.latest_block()
+                    progress.chain_head_block = latest
+                    if latest >= next_min_block:
+                        current_end = latest
+                        current_start = next_min_block
+                        progress.target_end_block = current_end
+                        progress.mode = "listen_backfill"
+                        logger.info(
+                            "new_head_detected",
+                            extra={
+                                "next_min_block": next_min_block,
+                                "latest_block": latest,
+                            },
+                        )
+                        break
+                    await asyncio.sleep(config.listen_poll_interval_s)
+
+                is_backfill_pass = False
+
+        finally:
+            if writer_lock_task is not None:
+                writer_lock_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await writer_lock_task
+
+            if writer_lock is not None and storage is not None:
+                _release_writer_lock(storage=storage, lock=writer_lock)
+                logger.info(
+                    "writer_lock_released",
+                    extra={
+                        "writer_lock_key": writer_lock.key,
+                        "writer_owner_id": writer_lock.owner_id,
+                    },
+                )
+
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+
+            await rpc.aclose()
+            logger.info(
+                "indexer_stopped",
+                extra={
+                    "contract_dir": contract_dir,
+                    "processed_ok": total_stats.processed_ok,
+                    "processed_failed": total_stats.processed_failed,
+                    "chunks_written": total_stats.chunks_written,
+                    "total_logs": total_stats.total_logs,
+                },
+            )
 
     return FetchDecodeOutput(stats=total_stats, contract_dir=contract_dir)

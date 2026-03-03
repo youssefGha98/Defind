@@ -1,0 +1,14 @@
+[Unit]
+Description=Defind Indexer Watchdog (heartbeat + lag)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/youssef/defind/Defind
+EnvironmentFile=/home/youssef/defind/Defind/ops/systemd/defind-watchdog.env
+Environment=PYTHONPATH=src
+ExecStart=/bin/bash -lc "${DEFIND_WATCHDOG_CMD}"
+NoNewPrivileges=true
+StandardOutput=append:/home/youssef/defind/Defind/defind-watchdog.log
+StandardError=append:/home/youssef/defind/Defind/defind-watchdog.log

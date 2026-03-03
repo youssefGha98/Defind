@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pyarrow as pa
+import pytest
 from pyarrow import fs as pa_fs
 
 from defind.storage.local import LocalChunkStorage
@@ -56,10 +57,17 @@ class _FakeS3FS:
         self.objects: dict[str, bytes] = {}
         self.raise_on_get = False
         self.raise_on_delete = False
+        self.fail_get_remaining = 0
+        self.fail_delete_remaining = 0
+        self.fail_open_output_remaining = 0
+        self.fail_open_input_remaining = 0
 
     def get_file_info(self, target: Any) -> Any:
         if self.raise_on_get:
             raise RuntimeError("boom")
+        if self.fail_get_remaining > 0:
+            self.fail_get_remaining -= 1
+            raise RuntimeError("503 Service Unavailable")
 
         if hasattr(target, "base_dir"):
             base = target.base_dir
@@ -77,12 +85,21 @@ class _FakeS3FS:
     def delete_file(self, path: str) -> None:
         if self.raise_on_delete:
             raise RuntimeError("delete failed")
+        if self.fail_delete_remaining > 0:
+            self.fail_delete_remaining -= 1
+            raise RuntimeError("503 Service Unavailable")
         self.objects.pop(path, None)
 
     def open_output_stream(self, path: str) -> _FakeOutputStream:
+        if self.fail_open_output_remaining > 0:
+            self.fail_open_output_remaining -= 1
+            raise RuntimeError("503 Service Unavailable")
         return _FakeOutputStream(self.objects, path)
 
     def open_input_file(self, path: str) -> _FakeInputFile:
+        if self.fail_open_input_remaining > 0:
+            self.fail_open_input_remaining -= 1
+            raise RuntimeError("503 Service Unavailable")
         if path not in self.objects:
             raise FileNotFoundError(path)
         return _FakeInputFile(self.objects[path])
@@ -129,7 +146,7 @@ def test_s3_chunk_storage_write_table_delegates_to_pyarrow() -> None:
     with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs), patch(
         "defind.storage.s3.pq.write_table"
     ) as write_table_mock:
-        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract")
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
         table = pa.table({"a": [1]})
         storage.write_table("Mint/chunk_0000000000_0000000001.parquet", table, "lz4")
 
@@ -144,28 +161,32 @@ def test_s3_chunk_storage_exists_and_list_keys() -> None:
     fake_fs.objects["bucket/proto/contract/Mint/chunk_0000000000_0000000001.parquet"] = b"x"
     fake_fs.objects["bucket/proto/contract/Mint/notes.txt"] = b"x"
     with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
-        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract")
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
 
     assert storage.exists("Mint/chunk_0000000000_0000000001.parquet") is True
     assert storage.exists("Mint/chunk_9999999999_9999999999.parquet") is False
     assert storage.list_keys("Mint/") == ["Mint/chunk_0000000000_0000000001.parquet"]
 
 
-def test_s3_chunk_storage_exists_returns_false_on_fs_error() -> None:
+def test_s3_chunk_storage_exists_and_list_fail_loud_on_fs_error() -> None:
     fake_fs = _FakeS3FS()
     fake_fs.raise_on_get = True
     with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
-        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract")
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
 
-    assert storage.exists("Mint/chunk_0000000000_0000000001.parquet") is False
-    assert storage.list_keys("Mint/") == []
+    with patch("defind.storage.s3.logger.error") as err_log:
+        with pytest.raises(RuntimeError):
+            storage.exists("Mint/chunk_0000000000_0000000001.parquet")
+        with pytest.raises(RuntimeError):
+            storage.list_keys("Mint/")
+    assert err_log.call_count >= 2
 
 
 def test_s3_chunk_storage_delete_is_idempotent() -> None:
     fake_fs = _FakeS3FS()
     fake_fs.objects["bucket/proto/contract/Mint/chunk_0000000000_0000000001.parquet"] = b"x"
     with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
-        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract")
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
 
     storage.delete("Mint/chunk_0000000000_0000000001.parquet")
     storage.delete("Mint/chunk_0000000000_0000000001.parquet")
@@ -178,7 +199,7 @@ def test_s3_chunk_storage_delete_is_idempotent() -> None:
 def test_s3_chunk_storage_write_and_read_json() -> None:
     fake_fs = _FakeS3FS()
     with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
-        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract")
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
 
     payload = {"version": 1, "event_names": ["Mint"]}
     storage.write_json("_meta/coverage_index.json", payload)
@@ -189,3 +210,33 @@ def test_s3_chunk_storage_write_and_read_json() -> None:
 
     fake_fs.objects["bucket/proto/contract/_meta/list.json"] = json.dumps([1, 2]).encode("utf-8")
     assert storage.read_json("_meta/list.json") is None
+
+
+def test_s3_chunk_storage_retries_write_table_then_succeeds() -> None:
+    fake_fs = _FakeS3FS()
+    with (
+        patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs),
+        patch(
+            "defind.storage.s3.pq.write_table",
+            side_effect=[RuntimeError("503 Service Unavailable"), None],
+        ) as write_table_mock,
+        patch("defind.storage.s3.time.sleep") as sleep_mock,
+    ):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=1, retry_backoff_s=0.01)
+        storage.write_table("Mint/chunk_0000000000_0000000001.parquet", pa.table({"a": [1]}), "lz4")
+
+    assert write_table_mock.call_count == 2
+    sleep_mock.assert_called_once()
+
+
+def test_s3_chunk_storage_retries_exists_then_succeeds() -> None:
+    fake_fs = _FakeS3FS()
+    fake_fs.fail_get_remaining = 1
+    fake_fs.objects["bucket/proto/contract/Mint/chunk_0000000000_0000000001.parquet"] = b"x"
+    with (
+        patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs),
+        patch("defind.storage.s3.time.sleep") as sleep_mock,
+    ):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=1, retry_backoff_s=0.01)
+        assert storage.exists("Mint/chunk_0000000000_0000000001.parquet") is True
+    sleep_mock.assert_called_once()

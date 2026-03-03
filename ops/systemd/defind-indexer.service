@@ -1,0 +1,21 @@
+[Unit]
+Description=Defind Indexer (single dataset worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/youssef/defind/Defind
+EnvironmentFile=/home/youssef/defind/Defind/ops/systemd/defind-indexer.env
+Environment=PYTHONPATH=src
+ExecStart=/bin/bash -lc "${DEFIND_RUN_CMD}"
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGINT
+NoNewPrivileges=true
+StandardOutput=append:/home/youssef/defind/Defind/defind.log
+StandardError=append:/home/youssef/defind/Defind/defind.log
+
+[Install]
+WantedBy=multi-user.target

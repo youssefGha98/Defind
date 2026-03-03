@@ -29,6 +29,8 @@ debugpy==1.8.16
     # via ipykernel
 decorator==5.2.1
     # via ipython
+dotenv==0.9.9
+    # via defind
 duckdb==1.4.2
     # via defind
 eth-abi==5.2.0
@@ -118,6 +120,8 @@ pygments==2.19.2
 python-dateutil==2.9.0.post0
     # via jupyter-client
     # via pandas
+python-dotenv==1.2.2
+    # via dotenv
 pytz==2025.2
     # via pandas
 pyzmq==27.0.2
