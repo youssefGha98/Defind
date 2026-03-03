@@ -43,6 +43,7 @@ def _ctx(
     storage: Any,
     force_reprocess: bool = False,
     print_chunk_writes: bool = False,
+    stop_event: asyncio.Event | None = None,
 ) -> ProcessContext:
     return ProcessContext(
         rpc=rpc,
@@ -57,6 +58,7 @@ def _ctx(
         print_chunk_writes=print_chunk_writes,
         force_reprocess=force_reprocess,
         stats=ProcessStats(),
+        stop_event=stop_event,
     )
 
 
@@ -126,6 +128,21 @@ async def test_process_interval_guardrails_on_seed_bounds() -> None:
 
     with pytest.raises(ValueError, match="seed.start must be <= seed.end"):
         await process_interval(context, WorkSeed(3, 2))
+
+
+@pytest.mark.asyncio
+async def test_process_interval_stops_when_lock_lost_event_is_set() -> None:
+    rpc = AsyncMock()
+    storage = MagicMock()
+    storage.exists.return_value = False
+    stop_event = asyncio.Event()
+    stop_event.set()
+    context = _ctx(rpc=rpc, storage=storage, stop_event=stop_event)
+
+    with pytest.raises(RuntimeError, match="writer lock lost during run"):
+        await process_interval(context, WorkSeed(0, 10))
+
+    rpc.get_logs.assert_not_awaited()
 
 
 @pytest.mark.asyncio

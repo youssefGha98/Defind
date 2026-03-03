@@ -157,6 +157,23 @@ def _lock_expiry(lock_payload: dict) -> int:
         return 0
 
 
+def _try_create_lock_if_absent(
+    *,
+    storage: IChunkStorage,
+    key: str,
+    payload: dict,
+) -> bool:
+    create_if_absent = getattr(storage, "create_json_if_absent", None)
+    if callable(create_if_absent) and hasattr(type(storage), "create_json_if_absent"):
+        return bool(create_if_absent(key, payload))
+
+    # Legacy fallback for backends without atomic-create support.
+    if storage.exists(key):
+        return False
+    storage.write_json(key, payload)
+    return True
+
+
 def _acquire_writer_lock(
     *,
     storage: IChunkStorage,
@@ -166,15 +183,6 @@ def _acquire_writer_lock(
     ttl_s: int,
 ) -> _WriterLock:
     now = int(time.time())
-    current = _read_writer_lock(storage, key)
-    if current is not None:
-        current_owner = str(current.get("owner_id") or "")
-        expires_at = _lock_expiry(current)
-        if current_owner and current_owner != owner_id and expires_at > now:
-            raise RuntimeError(
-                f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}"
-            )
-
     payload = {
         "version": 1,
         "owner_id": owner_id,
@@ -185,7 +193,26 @@ def _acquire_writer_lock(
         "refreshed_at_s": now,
         "expires_at_s": now + ttl_s,
     }
-    storage.write_json(key, payload)
+    created = _try_create_lock_if_absent(storage=storage, key=key, payload=payload)
+    if not created:
+        current = _read_writer_lock(storage, key)
+        current_owner = str((current or {}).get("owner_id") or "")
+        expires_at = _lock_expiry(current or {})
+        if current_owner and current_owner != owner_id and expires_at > now:
+            raise RuntimeError(
+                f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}"
+            )
+
+        # Stale lock takeover path.
+        storage.delete(key)
+        created = _try_create_lock_if_absent(storage=storage, key=key, payload=payload)
+        if not created:
+            check_existing = _read_writer_lock(storage, key)
+            observed = None if not isinstance(check_existing, dict) else check_existing.get("owner_id")
+            raise RuntimeError(
+                f"failed to acquire writer lock key={key}; observed_owner={observed}"
+            )
+
     check = _read_writer_lock(storage, key)
     if not isinstance(check, dict) or str(check.get("owner_id") or "") != owner_id:
         observed = None if not isinstance(check, dict) else check.get("owner_id")
@@ -272,6 +299,7 @@ async def _writer_lock_refresh_loop(
     lock: _WriterLock,
     refresh_interval_s: float,
     lock_errors: list[Exception],
+    lock_lost_event: asyncio.Event,
 ) -> None:
     while True:
         try:
@@ -282,6 +310,7 @@ async def _writer_lock_refresh_loop(
             )
         except Exception as exc:
             lock_errors.append(exc)
+            lock_lost_event.set()
             logger.error(
                 "writer_lock_refresh_failed",
                 extra={"writer_lock_key": lock.key, "writer_owner_id": lock.owner_id, "error": str(exc)},
@@ -295,6 +324,35 @@ def _raise_if_writer_lock_lost(lock_errors: list[Exception]) -> None:
     if not lock_errors:
         return
     raise RuntimeError("writer lock lost during run") from lock_errors[0]
+
+
+def _validate_index_fallback_recent_presence(
+    *,
+    storage: IChunkStorage,
+    event_names: list[str],
+    done_chunks: list[tuple[int, int]],
+    sample_size: int = 25,
+    min_ratio: float = 0.8,
+) -> tuple[int, int, float]:
+    if not done_chunks:
+        return 0, 0, 1.0
+    if sample_size <= 0:
+        return 0, 0, 1.0
+
+    recent = sorted(done_chunks, key=lambda iv: iv[1])[-sample_size:]
+    present = 0
+    for a, b in recent:
+        if all(storage.exists(chunk_key(ev, a, b)) for ev in event_names):
+            present += 1
+
+    checked = len(recent)
+    ratio = float(present) / float(checked)
+    if ratio < min_ratio:
+        raise RuntimeError(
+            "index fallback validation failed: "
+            f"present={present} checked={checked} ratio={ratio:.2f} min_ratio={min_ratio:.2f}"
+        )
+    return present, checked, ratio
 
 
 # ---------------------------------------------------------------------------
@@ -655,9 +713,28 @@ def _load_done_chunks_with_index_fallback(
         if indexed is None:
             logger.error("done_chunk_scan_failed_no_index", extra={"error": str(exc)}, exc_info=True)
             raise
+        try:
+            present, checked, ratio = _validate_index_fallback_recent_presence(
+                storage=storage,
+                event_names=event_names,
+                done_chunks=indexed,
+            )
+        except Exception as validation_exc:
+            logger.error(
+                "done_chunk_scan_failed_index_rejected",
+                extra={"error": str(exc), "validation_error": str(validation_exc)},
+                exc_info=True,
+            )
+            raise
         logger.warning(
             "done_chunk_scan_failed_using_index",
-            extra={"error": str(exc), "indexed_chunk_count": len(indexed)},
+            extra={
+                "error": str(exc),
+                "indexed_chunk_count": len(indexed),
+                "indexed_recent_checked": checked,
+                "indexed_recent_present": present,
+                "indexed_recent_ratio": ratio,
+            },
         )
         return indexed, "index"
 
@@ -715,6 +792,7 @@ async def fetch_decode(
     writer_lock: _WriterLock | None = None
     writer_lock_task: asyncio.Task | None = None
     writer_lock_errors: list[Exception] = []
+    writer_lock_lost_event = asyncio.Event()
     storage: IChunkStorage | None = None
     total_stats = ProcessStats()
     contract_dir = ""
@@ -748,6 +826,7 @@ async def fetch_decode(
                         lock=writer_lock,
                         refresh_interval_s=config.writer_lock_refresh_s,
                         lock_errors=writer_lock_errors,
+                        lock_lost_event=writer_lock_lost_event,
                     )
                 )
 
@@ -858,6 +937,7 @@ async def fetch_decode(
                     storage=storage,
                     seeds=startup_compaction_seeds,
                     force_reprocess=True,
+                    stop_event=writer_lock_lost_event if config.single_writer_guard else None,
                 )
                 _merge_stats(total_stats, delta_stats)
                 _cleanup_redundant_old_chunks(
@@ -898,6 +978,7 @@ async def fetch_decode(
                             storage=storage,
                             seeds=reorg_seeds,
                             force_reprocess=True,
+                            stop_event=writer_lock_lost_event if config.single_writer_guard else None,
                         )
                         _merge_stats(total_stats, delta_stats)
 
@@ -936,6 +1017,7 @@ async def fetch_decode(
                         storage=storage,
                         seeds=seeds,
                         force_reprocess=False,
+                        stop_event=writer_lock_lost_event if config.single_writer_guard else None,
                     )
                     _merge_stats(total_stats, delta_stats)
                     _cleanup_redundant_old_chunks(

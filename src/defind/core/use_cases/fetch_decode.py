@@ -80,6 +80,7 @@ class ProcessContext:
     print_chunk_writes: bool
     force_reprocess: bool
     stats: ProcessStats
+    stop_event: asyncio.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -280,10 +281,14 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         raise ValueError("seed bounds must be >= 0")
     if seed.start > seed.end:
         raise ValueError("seed.start must be <= seed.end")
+    if ctx.stop_event is not None and ctx.stop_event.is_set():
+        raise RuntimeError("writer lock lost during run")
 
     stack: list[WorkSeed] = [seed]
 
     while stack:
+        if ctx.stop_event is not None and ctx.stop_event.is_set():
+            raise RuntimeError("writer lock lost during run")
         current = stack.pop()
         a, b = current.start, current.end
 
@@ -338,6 +343,8 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
             continue
 
         buffers = _decode_logs(logs, ctx.registry)
+        if ctx.stop_event is not None and ctx.stop_event.is_set():
+            raise RuntimeError("writer lock lost during run")
         written = write_chunk(
             ctx.storage, ctx.registry, a, b, buffers, ctx.codec
         )
@@ -408,6 +415,7 @@ class FetchDecodeService:
         storage: IChunkStorage,
         seeds: list[WorkSeed],
         force_reprocess: bool = False,
+        stop_event: asyncio.Event | None = None,
     ) -> ProcessStats:
         """Execute the decoding process over the given block seeds."""
         self._validate_inputs(config, seeds)
@@ -433,6 +441,7 @@ class FetchDecodeService:
             print_chunk_writes=config.print_chunk_writes,
             force_reprocess=force_reprocess,
             stats=stats,
+            stop_event=stop_event,
         )
 
         worker_count = min(len(seeds), max(1, config.concurrency))
@@ -441,6 +450,8 @@ class FetchDecodeService:
 
         async def _worker() -> None:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("writer lock lost during run")
                 async with seed_lock:
                     try:
                         seed = next(seed_iter)

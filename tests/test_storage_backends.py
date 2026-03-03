@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pytest
@@ -132,6 +132,16 @@ def test_local_chunk_storage_write_and_read_json(tmp_path: Path) -> None:
     assert storage.read_json(key) == payload
 
 
+def test_local_chunk_storage_create_json_if_absent(tmp_path: Path) -> None:
+    storage = LocalChunkStorage(tmp_path / "chunks")
+    key = "_meta/writer.lock.json"
+    payload = {"owner_id": "a"}
+
+    assert storage.create_json_if_absent(key, payload) is True
+    assert storage.create_json_if_absent(key, payload) is False
+    assert storage.read_json(key) == payload
+
+
 def test_local_chunk_storage_read_json_invalid_returns_none(tmp_path: Path) -> None:
     storage = LocalChunkStorage(tmp_path / "chunks")
     p = (tmp_path / "chunks" / "_meta" / "coverage_index.json")
@@ -210,6 +220,37 @@ def test_s3_chunk_storage_write_and_read_json() -> None:
 
     fake_fs.objects["bucket/proto/contract/_meta/list.json"] = json.dumps([1, 2]).encode("utf-8")
     assert storage.read_json("_meta/list.json") is None
+
+
+def test_s3_chunk_storage_create_json_if_absent_uses_conditional_put() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+    storage._s3_client = MagicMock()
+    storage._s3_client.put_object.return_value = None
+
+    assert storage.create_json_if_absent("_meta/writer.lock.json", {"owner_id": "a"}) is True
+    storage._s3_client.put_object.assert_called_once()
+
+
+def test_s3_chunk_storage_create_json_if_absent_returns_false_on_precondition_failed() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    storage._s3_client = MagicMock()
+    storage._s3_client.put_object.side_effect = RuntimeError("PreconditionFailed: 412")
+    assert storage.create_json_if_absent("_meta/writer.lock.json", {"owner_id": "a"}) is False
+
+
+def test_s3_chunk_storage_create_json_if_absent_raises_when_client_unavailable() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+    storage._s3_client = None
+
+    with pytest.raises(RuntimeError, match="Atomic S3 lock requires boto3"):
+        storage.create_json_if_absent("_meta/writer.lock.json", {"owner_id": "a"})
 
 
 def test_s3_chunk_storage_retries_write_table_then_succeeds() -> None:

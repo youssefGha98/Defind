@@ -63,6 +63,27 @@ class LocalChunkStorage(IChunkStorage):
         tmp_path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         os.replace(tmp_path, out_path)
 
+    def create_json_if_absent(self, key: str, payload: dict) -> bool:
+        out_path = self._full_path(key)
+        out_path.parent.mkdir(exist_ok=True, parents=True)
+        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            fd = os.open(out_path, flags, 0o644)
+        except FileExistsError:
+            return False
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(raw)
+        except Exception:
+            # Best effort cleanup if write fails after create.
+            try:
+                out_path.unlink()
+            except Exception:
+                pass
+            raise
+        return True
+
     def read_json(self, key: str) -> dict | None:
         path = self._full_path(key)
         if not path.exists():

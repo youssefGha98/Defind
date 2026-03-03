@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -11,6 +11,13 @@ from pyarrow import fs as pa_fs
 
 from defind.core.interfaces import IChunkStorage
 from defind.observability import get_logger
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except Exception:  # pragma: no cover - optional runtime dependency
+    boto3 = None
+    ClientError = Exception
 
 logger = get_logger(__name__)
 T = TypeVar("T")
@@ -88,6 +95,7 @@ class S3ChunkStorage(IChunkStorage):
         self.prefix = prefix.rstrip("/") + "/" if prefix else ""
         self._max_retries = max(0, int(max_retries))
         self._retry_backoff_s = max(0.0, float(retry_backoff_s))
+        self._s3_client: Any | None = None
 
         fs_kwargs: dict = {"region": region}
         if endpoint_url:
@@ -97,6 +105,19 @@ class S3ChunkStorage(IChunkStorage):
             fs_kwargs["secret_key"] = secret_key
 
         self._fs = pa_fs.S3FileSystem(**fs_kwargs)
+        if boto3 is not None:
+            client_kwargs: dict[str, Any] = {}
+            if endpoint_url:
+                client_kwargs["endpoint_url"] = endpoint_url
+            if access_key and secret_key:
+                client_kwargs["aws_access_key_id"] = access_key
+                client_kwargs["aws_secret_access_key"] = secret_key
+            if region and region != "auto":
+                client_kwargs["region_name"] = region
+            try:
+                self._s3_client = boto3.client("s3", **client_kwargs)
+            except Exception:
+                self._s3_client = None
 
     def _is_retryable_exception(self, exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -113,6 +134,16 @@ class S3ChunkStorage(IChunkStorage):
     def _is_not_found_exception(exc: Exception) -> bool:
         msg = str(exc).lower()
         return any(marker in msg for marker in _NOT_FOUND_MARKERS)
+
+    @staticmethod
+    def _is_precondition_failed_exception(exc: Exception) -> bool:
+        if isinstance(exc, ClientError) and hasattr(exc, "response"):
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+            if code in ("PreconditionFailed", "412") or status == 412:
+                return True
+        msg = str(exc).lower()
+        return ("precondition" in msg and "failed" in msg) or "412" in msg
 
     def _with_retries(self, op_name: str, fn: Callable[[], T]) -> T:
         attempt = 0
@@ -222,6 +253,33 @@ class S3ChunkStorage(IChunkStorage):
             with self._fs.open_output_stream(s3_path) as out:
                 out.write(raw)
         self._with_retries("write_json", _do_write)
+
+    def create_json_if_absent(self, key: str, payload: dict) -> bool:
+        if self._s3_client is None:
+            raise RuntimeError(
+                "Atomic S3 lock requires boto3/botocore client support; "
+                "install boto3 or disable single_writer_guard for this backend"
+            )
+
+        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        s3_key = f"{self.prefix}{key}"
+
+        def _put_conditional() -> None:
+            self._s3_client.put_object(
+                Bucket=self.bucket,
+                Key=s3_key,
+                Body=raw,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+
+        try:
+            self._with_retries("create_json_if_absent", _put_conditional)
+            return True
+        except Exception as exc:
+            if self._is_precondition_failed_exception(exc):
+                return False
+            raise
 
     def read_json(self, key: str) -> dict | None:
         s3_path = self._s3_path(key)

@@ -83,6 +83,12 @@ class _MemJsonStorage:
     def list_keys(self, prefix: str) -> list[str]:
         return []
 
+    def create_json_if_absent(self, key: str, payload: dict) -> bool:
+        if key in self._json:
+            return False
+        self._json[key] = dict(payload)
+        return True
+
 
 @pytest.mark.asyncio
 async def test_resolve_block_range_supports_keywords_and_hex() -> None:
@@ -227,6 +233,29 @@ def test_writer_lock_rejects_active_other_owner() -> None:
         )
 
 
+def test_writer_lock_can_take_over_stale_lock() -> None:
+    storage = _MemJsonStorage()
+    storage.write_json(
+        "_meta/writer.lock.json",
+        {
+            "owner_id": "owner-a",
+            "run_id": "run-a",
+            "acquired_at_s": 0,
+            "refreshed_at_s": 0,
+            "expires_at_s": 1,
+        },
+    )
+    lock = _acquire_writer_lock(
+        storage=storage,
+        key="_meta/writer.lock.json",
+        owner_id="owner-b",
+        run_id="run-b",
+        ttl_s=120,
+    )
+    assert lock.owner_id == "owner-b"
+    assert storage.read_json("_meta/writer.lock.json")["owner_id"] == "owner-b"
+
+
 def test_writer_lock_refresh_detects_owner_loss() -> None:
     storage = _MemJsonStorage()
     lock = _acquire_writer_lock(
@@ -273,6 +302,20 @@ def test_load_done_chunks_with_index_fallback_raises_when_no_index() -> None:
         patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=None),
     ):
         with pytest.raises(RuntimeError, match="s3 unavailable"):
+            _load_done_chunks_with_index_fallback(storage, ["Event"])
+
+
+def test_load_done_chunks_with_index_fallback_rejects_suspicious_index() -> None:
+    storage = MagicMock()
+    storage.exists.return_value = False
+    with (
+        patch("defind.orchestration.orchestrator.load_done_chunks", side_effect=RuntimeError("s3 unavailable")),
+        patch(
+            "defind.orchestration.orchestrator.load_done_chunks_from_index",
+            return_value=[(0, 99), (100, 199), (200, 299), (300, 399), (400, 499)],
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="index fallback validation failed"):
             _load_done_chunks_with_index_fallback(storage, ["Event"])
 
 
