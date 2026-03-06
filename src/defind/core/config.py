@@ -18,15 +18,15 @@ class OrchestratorConfig:
     contract_slug: str
 
     # Fetch tuning
-    step: int = 5_000              # taille des appels RPC (blocs par requête)
+    step: int = 5_000  # taille des appels RPC (blocs par requête)
     chunk_size: int | None = None  # taille du fichier de sortie (blocs par Parquet)
-                                   # None → même valeur que step (1 fichier par step)
+    # None → même valeur que step (1 fichier par step)
     concurrency: int = 16
     timeout_s: int = 20
     rpc_max_retries: int = 3
     rpc_retry_backoff_s: float = 0.5
-    codec: str = "lz4"            # compression Parquet ("lz4", "zstd", "snappy", "none")
-    listen: bool = False          # continue polling after backfill
+    codec: str = "lz4"  # compression Parquet ("lz4", "zstd", "snappy", "none")
+    listen: bool = False  # continue polling after backfill
     listen_poll_interval_s: float = 2.0
     reorg_lookback_blocks: int = 0  # in listen mode, reprocess the last N blocks when a new block arrives
     print_chunk_writes: bool = False  # print each written chunk key/interval

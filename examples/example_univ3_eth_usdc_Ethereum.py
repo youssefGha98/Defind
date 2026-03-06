@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pandas as pd
@@ -25,12 +26,14 @@ config = OrchestratorConfig(
     topic0s=get_event_registry_topic0s(registry),
     start_block=12376729,  # Creation block of the pool
     end_block="latest",
+    protocol_slug="uniswap",
+    contract_slug="usdc_weth",
     out_root=OUT_ROOT,
     step=20_000,
 )
 
 
-async def fetch_data():
+async def fetch_data() -> Any:
     result = await fetch_decode(
         config=config,
         registry=registry,
@@ -38,7 +41,7 @@ async def fetch_data():
     return result
 
 
-async def main():
+async def main() -> None:
     result = await fetch_data()
 
     df = pd.read_parquet(

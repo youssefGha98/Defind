@@ -4,7 +4,7 @@ import pytest
 
 
 @pytest.fixture
-def mock_rpc():
+def mock_rpc() -> AsyncMock:
     rpc = AsyncMock()
     rpc.get_logs = AsyncMock(return_value=[])
     rpc.latest_block = AsyncMock(return_value=100)

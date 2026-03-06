@@ -44,8 +44,8 @@ def _make_registry() -> EventRegistry:
 ADDR = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"  # valid checksum address
 
 
-def _base_config(**kwargs) -> OrchestratorConfig:
-    defaults = dict(
+def _base_config(**kwargs: Any) -> OrchestratorConfig:
+    defaults: dict[str, Any] = dict(
         rpc_url="http://localhost:8545",
         address=ADDR,
         topic0s=["0xabc"],
@@ -62,7 +62,7 @@ def _base_config(**kwargs) -> OrchestratorConfig:
 async def test_fetch_decode_empty_seeds(mock_rpc: Any) -> None:
     registry = _make_registry()
     mock_storage = MagicMock()
-    mock_storage.exists.return_value = True   # all chunks "done" → no work
+    mock_storage.exists.return_value = True  # all chunks "done" → no work
 
     with (
         patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
@@ -90,7 +90,7 @@ async def test_fetch_decode_with_work(mock_rpc: Any) -> None:
 
     registry = _make_registry()
     mock_storage = MagicMock()
-    mock_storage.exists.return_value = False   # nothing done yet
+    mock_storage.exists.return_value = False  # nothing done yet
     mock_storage.write_table.return_value = None
     mock_storage.list_keys.return_value = []
 
@@ -468,8 +468,8 @@ def test_cleanup_redundant_old_chunks_deletes_orphan_partials() -> None:
     storage.delete.return_value = None
     storage.list_keys.side_effect = lambda prefix: {
         "E1/": [
-            "E1/chunk_0000000000_0000000099.parquet",   # orphan partial
-            "E1/chunk_0000000000_0000000199.parquet",   # new full chunk
+            "E1/chunk_0000000000_0000000099.parquet",  # orphan partial
+            "E1/chunk_0000000000_0000000199.parquet",  # new full chunk
         ],
         "E2/": [
             "E2/chunk_0000000000_0000000199.parquet",

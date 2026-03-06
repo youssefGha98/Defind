@@ -33,6 +33,7 @@ def add_many(registry: EventRegistry, specs: Iterable[EventSpec]) -> None:
     for s in specs:
         add_event_spec(registry, s)
 
+
 class EventRegistryProvider(IEventRegistryProvider):
     """
     Simple registry provider that always returns the same EventRegistry.

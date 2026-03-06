@@ -3,6 +3,7 @@ site_description: High-performance, Python-native DeFi log fetcher.
 site_author: youssefGha98
 repo_url: https://github.com/youssefGha98/defind
 repo_name: youssefGha98/defind
+docs_dir: .
 
 theme:
   name: material
@@ -25,4 +26,17 @@ plugins:
   - search
 
 nav:
-  - Home: index.md
+  - Home: README.md
+
+exclude_docs: |
+  .venv/**
+  .git/**
+  .pytest_cache/**
+  .mypy_cache/**
+  .ruff_cache/**
+  __pycache__/**
+  tests/**
+  src/**
+  examples/**
+  data*/**
+  debug/**

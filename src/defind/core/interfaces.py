@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pyarrow as pa
 
 from defind.core.models import EventLog
 
+if TYPE_CHECKING:
+    from defind.decoding.specs import EventRegistry
+
 # ---------------------------------------------------------------------------
 # IEvmLogsProvider
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class IEvmLogsProvider(Protocol):
@@ -27,16 +31,15 @@ class IEvmLogsProvider(Protocol):
         topic0s: list[str],
         from_block: int,
         to_block: int,
-    ) -> list[EventLog]:
-        ...
+    ) -> list[EventLog]: ...
 
-    async def latest_block(self) -> int:
-        ...
+    async def latest_block(self) -> int: ...
 
 
 # ---------------------------------------------------------------------------
 # IEventRegistryProvider
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class IEventRegistryProvider(Protocol):
@@ -44,13 +47,13 @@ class IEventRegistryProvider(Protocol):
     Abstract provider of EventRegistry objects used for decoding events.
     """
 
-    def get_registry(self):
-        ...
+    def get_registry(self) -> EventRegistry: ...
 
 
 # ---------------------------------------------------------------------------
 # IChunkStorage
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class IChunkStorage(Protocol):
@@ -89,10 +92,10 @@ class IChunkStorage(Protocol):
         """Delete a key if present (best effort for idempotent maintenance)."""
         ...
 
-    def write_json(self, key: str, payload: dict) -> None:
+    def write_json(self, key: str, payload: dict[str, Any]) -> None:
         """Write a JSON payload to a relative key."""
         ...
 
-    def read_json(self, key: str) -> dict | None:
+    def read_json(self, key: str) -> dict[str, Any] | None:
         """Read a JSON payload from a relative key, or None if missing/invalid."""
         ...

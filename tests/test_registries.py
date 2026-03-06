@@ -4,23 +4,23 @@ from defind.abi_events import get_event_topic0, get_events_from_abi, make_event_
 from defind.decoding.registries import make_clpool_registry, make_gauge_registry, make_nfpm_registry, make_vfat_registry
 
 
-def test_make_clpool_registry():
+def test_make_clpool_registry() -> None:
     make_clpool_registry()
 
 
-def test_make_gauge_registry():
+def test_make_gauge_registry() -> None:
     make_gauge_registry()
 
 
-def test_make_vfat_registry():
+def test_make_vfat_registry() -> None:
     make_vfat_registry()
 
 
-def test_make_nfpm_registry():
+def test_make_nfpm_registry() -> None:
     make_nfpm_registry()
 
 
-def test_make_event_registry_from_abi():
+def test_make_event_registry_from_abi() -> None:
     abi = Path(__file__).parent / "abi" / "aerodrome_clpool_abi.json"
     assert abi.is_file()
     registry = make_event_registry_from_abi(abi)

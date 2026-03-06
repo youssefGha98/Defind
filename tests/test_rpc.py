@@ -1,3 +1,4 @@
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -6,7 +7,7 @@ import pytest
 from defind.clients.rpc import RPC, topics_param
 
 
-def _http_response(status: int, payload: dict) -> httpx.Response:
+def _http_response(status: int, payload: dict[str, Any]) -> httpx.Response:
     req = httpx.Request("POST", "http://localhost:8545")
     return httpx.Response(status, request=req, json=payload)
 
@@ -14,18 +15,19 @@ def _http_response(status: int, payload: dict) -> httpx.Response:
 @pytest.mark.asyncio
 async def test_post_json_retries_on_http_429_then_succeeds() -> None:
     rpc = RPC("http://localhost:8545", max_retries=2, retry_backoff_s=0.01)
-    rpc.client.post = AsyncMock(
+    post_mock = AsyncMock(
         side_effect=[
             _http_response(429, {"error": {"code": -32000, "message": "rate limited"}}),
             _http_response(200, {"result": "ok"}),
         ]
     )
+    cast(Any, rpc.client).post = post_mock
 
     with patch("defind.clients.rpc.asyncio.sleep", new=AsyncMock()) as sleep_mock:
         out = await rpc._post_json({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []})
 
     assert out == {"result": "ok"}
-    assert rpc.client.post.await_count == 2
+    assert post_mock.await_count == 2
     sleep_mock.assert_awaited_once()
     await rpc.aclose()
 
@@ -33,15 +35,14 @@ async def test_post_json_retries_on_http_429_then_succeeds() -> None:
 @pytest.mark.asyncio
 async def test_post_json_does_not_retry_on_http_400() -> None:
     rpc = RPC("http://localhost:8545", max_retries=3, retry_backoff_s=0.01)
-    rpc.client.post = AsyncMock(
-        return_value=_http_response(400, {"error": {"code": -32602, "message": "bad request"}})
-    )
+    post_mock = AsyncMock(return_value=_http_response(400, {"error": {"code": -32602, "message": "bad request"}}))
+    cast(Any, rpc.client).post = post_mock
 
     with patch("defind.clients.rpc.asyncio.sleep", new=AsyncMock()) as sleep_mock:
         with pytest.raises(httpx.HTTPStatusError):
             await rpc._post_json({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []})
 
-    assert rpc.client.post.await_count == 1
+    assert post_mock.await_count == 1
     sleep_mock.assert_not_awaited()
     await rpc.aclose()
 
@@ -50,18 +51,19 @@ async def test_post_json_does_not_retry_on_http_400() -> None:
 async def test_post_json_retries_on_transport_error_then_succeeds() -> None:
     rpc = RPC("http://localhost:8545", max_retries=2, retry_backoff_s=0.01)
     req = httpx.Request("POST", "http://localhost:8545")
-    rpc.client.post = AsyncMock(
+    post_mock = AsyncMock(
         side_effect=[
             httpx.ConnectError("network down", request=req),
             _http_response(200, {"result": "ok"}),
         ]
     )
+    cast(Any, rpc.client).post = post_mock
 
     with patch("defind.clients.rpc.asyncio.sleep", new=AsyncMock()) as sleep_mock:
         out = await rpc._post_json({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []})
 
     assert out == {"result": "ok"}
-    assert rpc.client.post.await_count == 2
+    assert post_mock.await_count == 2
     sleep_mock.assert_awaited_once()
     await rpc.aclose()
 
@@ -70,13 +72,14 @@ async def test_post_json_retries_on_transport_error_then_succeeds() -> None:
 async def test_post_json_raises_after_max_retries_exhausted() -> None:
     rpc = RPC("http://localhost:8545", max_retries=2, retry_backoff_s=0.0)
     req = httpx.Request("POST", "http://localhost:8545")
-    rpc.client.post = AsyncMock(side_effect=httpx.ReadTimeout("timeout", request=req))
+    post_mock = AsyncMock(side_effect=httpx.ReadTimeout("timeout", request=req))
+    cast(Any, rpc.client).post = post_mock
 
     with pytest.raises(httpx.ReadTimeout):
         await rpc._post_json({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []})
 
     # initial try + 2 retries
-    assert rpc.client.post.await_count == 3
+    assert post_mock.await_count == 3
     await rpc.aclose()
 
 
@@ -87,7 +90,7 @@ def test_topics_param_lowercases_values() -> None:
 @pytest.mark.asyncio
 async def test_latest_block_raises_on_rpc_error_payload() -> None:
     rpc = RPC("http://localhost:8545")
-    rpc._post_json = AsyncMock(return_value={"error": {"code": -32000, "message": "oops"}})
+    cast(Any, rpc)._post_json = AsyncMock(return_value={"error": {"code": -32000, "message": "oops"}})
 
     with pytest.raises(RuntimeError, match="RPC error: -32000 oops"):
         await rpc.latest_block()
@@ -98,7 +101,7 @@ async def test_latest_block_raises_on_rpc_error_payload() -> None:
 @pytest.mark.asyncio
 async def test_get_logs_parses_fields_and_fallback_hash_keys() -> None:
     rpc = RPC("http://localhost:8545")
-    rpc._post_json = AsyncMock(
+    cast(Any, rpc)._post_json = AsyncMock(
         return_value={
             "result": [
                 {
@@ -144,7 +147,7 @@ async def test_get_logs_parses_fields_and_fallback_hash_keys() -> None:
 @pytest.mark.asyncio
 async def test_get_logs_raises_on_rpc_error_payload() -> None:
     rpc = RPC("http://localhost:8545")
-    rpc._post_json = AsyncMock(return_value={"error": {"code": -32005, "message": "too many"}})
+    cast(Any, rpc)._post_json = AsyncMock(return_value={"error": {"code": -32005, "message": "too many"}})
 
     with pytest.raises(RuntimeError, match="RPC error: -32005 too many"):
         await rpc.get_logs(
@@ -160,8 +163,9 @@ async def test_get_logs_raises_on_rpc_error_payload() -> None:
 @pytest.mark.asyncio
 async def test_aclose_closes_underlying_client() -> None:
     rpc = RPC("http://localhost:8545")
-    rpc.client.aclose = AsyncMock()
+    aclose_mock = AsyncMock()
+    cast(Any, rpc.client).aclose = aclose_mock
 
     await rpc.aclose()
 
-    rpc.client.aclose.assert_awaited_once()
+    aclose_mock.assert_awaited_once()

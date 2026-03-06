@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from typing import Any, TypeVar
+from datetime import datetime, timedelta, timezone
+from typing import Any, TypeVar, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -42,6 +43,11 @@ _NOT_FOUND_MARKERS = (
     "no such file",
     "does not exist",
     "404",
+)
+_NO_SUCH_UPLOAD_MARKERS = (
+    "nosuchupload",
+    "no such upload",
+    "upload not found",
 )
 
 
@@ -97,7 +103,7 @@ class S3ChunkStorage(IChunkStorage):
         self._retry_backoff_s = max(0.0, float(retry_backoff_s))
         self._s3_client: Any | None = None
 
-        fs_kwargs: dict = {"region": region}
+        fs_kwargs: dict[str, Any] = {"region": region}
         if endpoint_url:
             fs_kwargs["endpoint_override"] = endpoint_url
         if access_key and secret_key:
@@ -177,6 +183,37 @@ class S3ChunkStorage(IChunkStorage):
     def _s3_path(self, key: str) -> str:
         return f"{self.bucket}/{self.prefix}{key}"
 
+    def _require_s3_client(self) -> Any:
+        if self._s3_client is None:
+            raise RuntimeError("S3 operation requires boto3/botocore client support; install boto3 for this backend")
+        return self._s3_client
+
+    def _normalize_relative_key(self, key: str) -> str:
+        normalized = key.lstrip("/")
+        if self.prefix and normalized.startswith(self.prefix):
+            return normalized.removeprefix(self.prefix)
+        return normalized
+
+    @staticmethod
+    def _is_no_such_upload_exception(exc: Exception) -> bool:
+        if isinstance(exc, ClientError) and hasattr(exc, "response"):
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+            if code in ("NoSuchUpload", "404") or status == 404:
+                return True
+        msg = str(exc).lower()
+        return any(marker in msg for marker in _NO_SUCH_UPLOAD_MARKERS)
+
+    @staticmethod
+    def _to_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _dt_to_rfc3339(dt: datetime) -> str:
+        return S3ChunkStorage._to_utc(dt).isoformat().replace("+00:00", "Z")
+
     def write_table(self, key: str, table: pa.Table, codec: str) -> None:
         s3_path = self._s3_path(key)
         self._with_retries(
@@ -194,7 +231,7 @@ class S3ChunkStorage(IChunkStorage):
         s3_path = self._s3_path(key)
         try:
             info = self._with_retries("exists", lambda: self._fs.get_file_info(s3_path))
-            return info.type == pa_fs.FileType.File
+            return bool(info.type == pa_fs.FileType.File)
         except Exception as exc:
             if self._is_not_found_exception(exc):
                 return False
@@ -246,16 +283,19 @@ class S3ChunkStorage(IChunkStorage):
                 extra={"path": f"s3://{s3_path}", "error": str(exc)},
             )
 
-    def write_json(self, key: str, payload: dict) -> None:
+    def write_json(self, key: str, payload: dict[str, Any]) -> None:
         s3_path = self._s3_path(key)
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
         def _do_write() -> None:
             with self._fs.open_output_stream(s3_path) as out:
                 out.write(raw)
+
         self._with_retries("write_json", _do_write)
 
-    def create_json_if_absent(self, key: str, payload: dict) -> bool:
-        if self._s3_client is None:
+    def create_json_if_absent(self, key: str, payload: dict[str, Any]) -> bool:
+        client = self._s3_client
+        if client is None:
             raise RuntimeError(
                 "Atomic S3 lock requires boto3/botocore client support; "
                 "install boto3 or disable single_writer_guard for this backend"
@@ -265,7 +305,7 @@ class S3ChunkStorage(IChunkStorage):
         s3_key = f"{self.prefix}{key}"
 
         def _put_conditional() -> None:
-            self._s3_client.put_object(
+            client.put_object(
                 Bucket=self.bucket,
                 Key=s3_key,
                 Body=raw,
@@ -281,18 +321,178 @@ class S3ChunkStorage(IChunkStorage):
                 return False
             raise
 
-    def read_json(self, key: str) -> dict | None:
+    def list_incomplete_multipart_uploads(
+        self,
+        *,
+        key_prefix: str = "",
+        older_than_s: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List ongoing multipart uploads for this storage prefix.
+
+        Parameters
+        ----------
+        key_prefix:
+            Optional relative prefix under this dataset (ex: "CollectProtocol/").
+        older_than_s:
+            If > 0, only keep uploads initiated at least this many seconds ago.
+        limit:
+            Optional max number of uploads returned.
+        """
+        if older_than_s < 0:
+            raise ValueError("older_than_s must be >= 0")
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be > 0 when provided")
+
+        client = self._require_s3_client()
+        rel_prefix = key_prefix.lstrip("/")
+        s3_prefix = f"{self.prefix}{rel_prefix}"
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=older_than_s)
+
+        uploads: list[dict[str, Any]] = []
+        list_kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": s3_prefix}
+
+        while True:
+            request_kwargs = list_kwargs.copy()
+
+            def _list_page(kwargs: dict[str, Any] = request_kwargs) -> dict[str, Any]:
+                return cast(dict[str, Any], client.list_multipart_uploads(**kwargs))
+
+            page = self._with_retries(
+                "list_multipart_uploads",
+                _list_page,
+            )
+            for upload in page.get("Uploads", []) or []:
+                key_raw = str(upload.get("Key", "")).strip()
+                upload_id = str(upload.get("UploadId", "")).strip()
+                initiated_raw = upload.get("Initiated")
+                initiated_dt = initiated_raw if isinstance(initiated_raw, datetime) else None
+                if initiated_dt is not None:
+                    initiated_dt = self._to_utc(initiated_dt)
+                if older_than_s > 0 and initiated_dt is not None and initiated_dt > cutoff_dt:
+                    continue
+                if not key_raw or not upload_id:
+                    continue
+                rel_key = self._normalize_relative_key(key_raw)
+                item: dict[str, Any] = {
+                    "key": rel_key,
+                    "upload_id": upload_id,
+                }
+                if initiated_dt is not None:
+                    item["initiated"] = self._dt_to_rfc3339(initiated_dt)
+                    item["age_s"] = max(
+                        0,
+                        int((datetime.now(timezone.utc) - initiated_dt).total_seconds()),
+                    )
+                uploads.append(item)
+                if limit is not None and len(uploads) >= limit:
+                    return uploads
+
+            if not page.get("IsTruncated"):
+                break
+            next_key_marker = page.get("NextKeyMarker")
+            next_upload_marker = page.get("NextUploadIdMarker")
+            if not next_key_marker:
+                break
+            list_kwargs["KeyMarker"] = next_key_marker
+            if next_upload_marker:
+                list_kwargs["UploadIdMarker"] = next_upload_marker
+
+        return uploads
+
+    def abort_incomplete_multipart_upload(self, *, key: str, upload_id: str) -> bool:
+        """Abort one multipart upload.
+
+        Returns False when the upload is already gone (idempotent behavior).
+        """
+        client = self._require_s3_client()
+        rel_key = self._normalize_relative_key(key)
+        s3_key = f"{self.prefix}{rel_key}"
+
+        def _do_abort() -> None:
+            client.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+            )
+
+        try:
+            self._with_retries("abort_multipart_upload", _do_abort)
+            logger.info(
+                "s3_multipart_upload_aborted",
+                extra={"bucket": self.bucket, "key": rel_key, "upload_id": upload_id},
+            )
+            return True
+        except Exception as exc:
+            if self._is_no_such_upload_exception(exc):
+                return False
+            raise
+
+    def cleanup_incomplete_multipart_uploads(
+        self,
+        *,
+        key_prefix: str = "",
+        older_than_s: int = 0,
+        dry_run: bool = True,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """List and optionally abort incomplete multipart uploads."""
+        uploads = self.list_incomplete_multipart_uploads(
+            key_prefix=key_prefix,
+            older_than_s=older_than_s,
+            limit=limit,
+        )
+        aborted = 0
+        failed = 0
+        if not dry_run:
+            for item in uploads:
+                try:
+                    if self.abort_incomplete_multipart_upload(key=item["key"], upload_id=item["upload_id"]):
+                        aborted += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning(
+                        "s3_multipart_upload_abort_failed",
+                        extra={
+                            "bucket": self.bucket,
+                            "key": item.get("key"),
+                            "upload_id": item.get("upload_id"),
+                            "error": str(exc),
+                        },
+                    )
+        summary = {
+            "dry_run": dry_run,
+            "found": len(uploads),
+            "aborted": aborted,
+            "failed": failed,
+            "uploads": uploads,
+        }
+        logger.info(
+            "s3_multipart_cleanup_summary",
+            extra={
+                "dry_run": dry_run,
+                "found": len(uploads),
+                "aborted": aborted,
+                "failed": failed,
+                "key_prefix": key_prefix,
+            },
+        )
+        return summary
+
+    def read_json(self, key: str) -> dict[str, Any] | None:
         s3_path = self._s3_path(key)
         try:
             info = self._with_retries("read_json_info", lambda: self._fs.get_file_info(s3_path))
             if info.type != pa_fs.FileType.File:
                 return None
+
             def _read_raw() -> bytes:
                 with self._fs.open_input_file(s3_path) as inp:
-                    return inp.read()
+                    return cast(bytes, inp.read())
+
             raw = self._with_retries("read_json", _read_raw)
             data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else None
+            return cast(dict[str, Any], data) if isinstance(data, dict) else None
         except Exception as exc:
             logger.warning(
                 "s3_read_json_failed path=s3://%s err=%s",

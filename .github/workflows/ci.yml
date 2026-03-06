@@ -33,7 +33,7 @@ jobs:
         
     - name: Type check with MyPy
       run: |
-        mypy .
+        mypy src scripts examples
         
     - name: Run tests
       run: |

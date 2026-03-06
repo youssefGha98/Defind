@@ -24,15 +24,15 @@ class AbiEvent(BaseModel):
     type: Literal["event"]
 
 
-def get_event_signature(event: AbiEvent):
+def get_event_signature(event: AbiEvent) -> str:
     return f"{event.name}({','.join(event_input.type for event_input in event.inputs)})"
 
 
-def get_event_topic0(event: AbiEvent):
+def get_event_topic0(event: AbiEvent) -> str:
     return "0x" + event_signature_to_log_topic(get_event_signature(event)).hex()
 
 
-def get_event_topic_field_specs(event: AbiEvent):
+def get_event_topic_field_specs(event: AbiEvent) -> list[TopicFieldSpec]:
     return [
         TopicFieldSpec(event_input.name, event_input_idx + 1, event_input.type)
         for event_input_idx, event_input in enumerate(
@@ -41,7 +41,7 @@ def get_event_topic_field_specs(event: AbiEvent):
     ]
 
 
-def get_event_data_field_specs(event: AbiEvent):
+def get_event_data_field_specs(event: AbiEvent) -> list[DataFieldSpec]:
     return [
         DataFieldSpec(event_input.name, event_input_idx, event_input.type)
         for event_input_idx, event_input in enumerate(
@@ -50,14 +50,13 @@ def get_event_data_field_specs(event: AbiEvent):
     ]
 
 
-def get_event_projection_ref(event_input: AbiInput):
+def get_event_projection_ref(event_input: AbiInput) -> ProjectionRefs.TopicRef | ProjectionRefs.DataRef:
     if event_input.indexed:
         return ProjectionRefs.TopicRef(name=event_input.name)
-    else:
-        return ProjectionRefs.DataRef(name=event_input.name)
+    return ProjectionRefs.DataRef(name=event_input.name)
 
 
-def get_event_spec(event: AbiEvent):
+def get_event_spec(event: AbiEvent) -> EventSpec:
     return EventSpec(
         topic0=get_event_topic0(event),
         name=event.name,
@@ -69,13 +68,16 @@ def get_event_spec(event: AbiEvent):
     )
 
 
-AbiJson = Iterable[dict[str, Any]]
+AbiJson = list[dict[str, Any]]
 AbiSpec = AbiJson | Path
 
 
 def _load_abi(abi: AbiSpec) -> AbiJson:
     if isinstance(abi, Path):
-        return json.loads(abi.read_text())
+        loaded = json.loads(abi.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list):
+            raise ValueError("ABI file must contain a JSON array")
+        return loaded
     return abi
 
 

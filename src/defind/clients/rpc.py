@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from typing import Any, cast
 
 import httpx
 
 from defind.core.interfaces import IEvmLogsProvider
 from defind.core.models import EventLog
+
+JsonDict = dict[str, Any]
 
 
 def to_hex_block(x: int) -> str:
@@ -67,14 +70,14 @@ class RPC(IEvmLogsProvider):
             http2=True,
         )
 
-    async def _post_json(self, payload: dict) -> dict:
+    async def _post_json(self, payload: JsonDict) -> JsonDict:
         delay = self.retry_backoff_s
         attempt = 0
         while True:
             try:
                 r = await self.client.post(self.url, json=payload)
                 r.raise_for_status()
-                return r.json()
+                return cast(JsonDict, r.json())
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 retryable = status in (408, 425, 429, 500, 502, 503, 504)

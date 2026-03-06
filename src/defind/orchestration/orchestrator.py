@@ -15,6 +15,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from defind.clients.rpc import RPC
 from defind.core.config import OrchestratorConfig
@@ -50,8 +51,9 @@ logger = get_logger(__name__)
 @dataclass(kw_only=True)
 class FetchDecodeOutput:
     """High-level output of the orchestrator."""
+
     stats: ProcessStats
-    contract_dir: str   # root key/path for all chunks of this contract
+    contract_dir: str  # root key/path for all chunks of this contract
 
 
 # ---------------------------------------------------------------------------
@@ -128,11 +130,7 @@ async def _heartbeat_loop(
             "chain_head_block": progress.chain_head_block,
             "lag_blocks": lag_blocks,
         }
-        if (
-            lag_blocks is not None
-            and lag_warn_threshold_blocks > 0
-            and lag_blocks > lag_warn_threshold_blocks
-        ):
+        if lag_blocks is not None and lag_warn_threshold_blocks > 0 and lag_blocks > lag_warn_threshold_blocks:
             logger.warning("heartbeat_lag_high", extra=base_extra)
         else:
             logger.info("heartbeat", extra=base_extra)
@@ -140,7 +138,7 @@ async def _heartbeat_loop(
         await asyncio.sleep(interval_s)
 
 
-def _read_writer_lock(storage: IChunkStorage, key: str) -> dict | None:
+def _read_writer_lock(storage: IChunkStorage, key: str) -> dict[str, Any] | None:
     exists = storage.exists(key)
     if not exists:
         return None
@@ -150,7 +148,7 @@ def _read_writer_lock(storage: IChunkStorage, key: str) -> dict | None:
     return data
 
 
-def _lock_expiry(lock_payload: dict) -> int:
+def _lock_expiry(lock_payload: dict[str, Any]) -> int:
     try:
         return int(lock_payload.get("expires_at_s", 0))
     except Exception:
@@ -161,7 +159,7 @@ def _try_create_lock_if_absent(
     *,
     storage: IChunkStorage,
     key: str,
-    payload: dict,
+    payload: dict[str, Any],
 ) -> bool:
     create_if_absent = getattr(storage, "create_json_if_absent", None)
     if callable(create_if_absent) and hasattr(type(storage), "create_json_if_absent"):
@@ -199,9 +197,7 @@ def _acquire_writer_lock(
         current_owner = str((current or {}).get("owner_id") or "")
         expires_at = _lock_expiry(current or {})
         if current_owner and current_owner != owner_id and expires_at > now:
-            raise RuntimeError(
-                f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}"
-            )
+            raise RuntimeError(f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}")
 
         # Stale lock takeover path.
         storage.delete(key)
@@ -209,16 +205,12 @@ def _acquire_writer_lock(
         if not created:
             check_existing = _read_writer_lock(storage, key)
             observed = None if not isinstance(check_existing, dict) else check_existing.get("owner_id")
-            raise RuntimeError(
-                f"failed to acquire writer lock key={key}; observed_owner={observed}"
-            )
+            raise RuntimeError(f"failed to acquire writer lock key={key}; observed_owner={observed}")
 
     check = _read_writer_lock(storage, key)
     if not isinstance(check, dict) or str(check.get("owner_id") or "") != owner_id:
         observed = None if not isinstance(check, dict) else check.get("owner_id")
-        raise RuntimeError(
-            f"failed to acquire writer lock key={key}; observed_owner={observed}"
-        )
+        raise RuntimeError(f"failed to acquire writer lock key={key}; observed_owner={observed}")
 
     return _WriterLock(
         key=key,
@@ -241,9 +233,7 @@ def _refresh_writer_lock(
 
     current_owner = str(current.get("owner_id") or "")
     if current_owner != lock.owner_id:
-        raise RuntimeError(
-            f"writer lock lost key={lock.key}; owner={current_owner} expected={lock.owner_id}"
-        )
+        raise RuntimeError(f"writer lock lost key={lock.key}; owner={current_owner} expected={lock.owner_id}")
 
     payload = {
         "version": 1,
@@ -259,9 +249,7 @@ def _refresh_writer_lock(
     check = _read_writer_lock(storage, lock.key)
     if not isinstance(check, dict) or str(check.get("owner_id") or "") != lock.owner_id:
         observed = None if not isinstance(check, dict) else check.get("owner_id")
-        raise RuntimeError(
-            f"writer lock verification failed key={lock.key}; observed_owner={observed}"
-        )
+        raise RuntimeError(f"writer lock verification failed key={lock.key}; observed_owner={observed}")
 
 
 def _release_writer_lock(
@@ -502,7 +490,7 @@ def _plan_seeds_with_tail_extension(
         tail_len = tb - ta + 1
         target_tail_end = min(ta + chunk_size - 1, current_end)
         # Never rewind before current_start unless the tail is exactly contiguous.
-        contiguous_left = (tb == current_start - 1)
+        contiguous_left = tb == current_start - 1
         no_rewind = ta >= current_start or contiguous_left
         # Do not extend tail if there are uncovered holes before it.
         has_gap_before_tail = False
@@ -788,9 +776,9 @@ async def fetch_decode(
         retry_backoff_s=config.rpc_retry_backoff_s,
     )
 
-    heartbeat_task: asyncio.Task | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     writer_lock: _WriterLock | None = None
-    writer_lock_task: asyncio.Task | None = None
+    writer_lock_task: asyncio.Task[None] | None = None
     writer_lock_errors: list[Exception] = []
     writer_lock_lost_event = asyncio.Event()
     storage: IChunkStorage | None = None
@@ -855,9 +843,7 @@ async def fetch_decode(
                 target_end_block=end,
                 last_indexed_block=start - 1,
                 chain_head_block=(
-                    end
-                    if isinstance(config.end_block, str) and config.end_block.lower() == "latest"
-                    else None
+                    end if isinstance(config.end_block, str) and config.end_block.lower() == "latest" else None
                 ),
             )
 

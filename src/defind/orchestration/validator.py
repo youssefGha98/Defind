@@ -82,10 +82,7 @@ def validate_coverage(
     union_chunks: set[tuple[int, int]] = set()
     for chunks in per_event.values():
         union_chunks.update(chunks)
-    event_mismatch_by_event = {
-        event: sorted(union_chunks - set(chunks))
-        for event, chunks in per_event.items()
-    }
+    event_mismatch_by_event = {event: sorted(union_chunks - set(chunks)) for event, chunks in per_event.items()}
 
     scanned_done_chunks = load_done_chunks(storage, event_names)
     indexed_done_chunks = load_done_chunks_from_index(storage, event_names)

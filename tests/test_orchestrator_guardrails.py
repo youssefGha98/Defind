@@ -33,7 +33,7 @@ ADDR = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
 
 
 def _base_config(**kwargs: Any) -> OrchestratorConfig:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         rpc_url="http://localhost:8545",
         address=ADDR,
         topic0s=["0xabc"],
@@ -65,12 +65,16 @@ def _make_registry() -> EventRegistry:
 
 class _MemJsonStorage:
     def __init__(self) -> None:
-        self._json: dict[str, dict] = {}
+        self._json: dict[str, dict[str, Any]] = {}
 
-    def write_json(self, key: str, payload: dict) -> None:
+    def write_table(self, key: str, table: Any, codec: str) -> None:
+        # lock tests use only JSON helpers; table writes are irrelevant here
+        return None
+
+    def write_json(self, key: str, payload: dict[str, Any]) -> None:
         self._json[key] = dict(payload)
 
-    def read_json(self, key: str) -> dict | None:
+    def read_json(self, key: str) -> dict[str, Any] | None:
         val = self._json.get(key)
         return None if val is None else dict(val)
 
@@ -83,7 +87,7 @@ class _MemJsonStorage:
     def list_keys(self, prefix: str) -> list[str]:
         return []
 
-    def create_json_if_absent(self, key: str, payload: dict) -> bool:
+    def create_json_if_absent(self, key: str, payload: dict[str, Any]) -> bool:
         if key in self._json:
             return False
         self._json[key] = dict(payload)
@@ -253,7 +257,9 @@ def test_writer_lock_can_take_over_stale_lock() -> None:
         ttl_s=120,
     )
     assert lock.owner_id == "owner-b"
-    assert storage.read_json("_meta/writer.lock.json")["owner_id"] == "owner-b"
+    lock_payload = storage.read_json("_meta/writer.lock.json")
+    assert lock_payload is not None
+    assert lock_payload["owner_id"] == "owner-b"
 
 
 def test_writer_lock_refresh_detects_owner_loss() -> None:

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 from defind.orchestration.validator import validate_coverage
 
 
-def _storage(keys_by_prefix: dict[str, list[str]], index_payload: dict | None) -> MagicMock:
+def _storage(
+    keys_by_prefix: dict[str, list[str]],
+    index_payload: dict[str, Any] | None,
+) -> MagicMock:
     storage = MagicMock()
     storage.list_keys.side_effect = lambda prefix: keys_by_prefix.get(prefix, [])
     storage.read_json.return_value = index_payload

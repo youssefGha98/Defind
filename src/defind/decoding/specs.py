@@ -86,8 +86,11 @@ class EventSpec:
     fast_zero_words: tuple[int, ...] = ()
     drop_if_all_zero_fields: tuple[str, ...] = ()
 
-    def __post_init__(self):
-        def _find_matches(ref_name: str, fields: Sequence[TopicFieldSpec | DataFieldSpec]):
+    def __post_init__(self) -> None:
+        def _find_matches(
+            ref_name: str,
+            fields: Sequence[TopicFieldSpec | DataFieldSpec],
+        ) -> list[TopicFieldSpec | DataFieldSpec]:
             return [field for field in fields if field.name == ref_name]
 
         for name, projection_ref in self.projection.items():
@@ -108,9 +111,9 @@ class EventSpec:
 EventRegistry = dict[str, EventSpec]
 
 
-def get_event_specs_topic0s(event_specs: Iterable[EventSpec]):
+def get_event_specs_topic0s(event_specs: Iterable[EventSpec]) -> list[str]:
     return [event_spec.topic0 for event_spec in event_specs]
 
 
-def get_event_registry_topic0s(registry: EventRegistry):
+def get_event_registry_topic0s(registry: EventRegistry) -> list[str]:
     return get_event_specs_topic0s(registry.values())

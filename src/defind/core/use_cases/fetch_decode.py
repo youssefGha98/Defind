@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -86,6 +87,7 @@ class ProcessContext:
 @dataclass(frozen=True)
 class WorkSeed:
     """Inclusive block interval to process (one output Parquet per seed)."""
+
     start: int
     end: int
 
@@ -93,10 +95,7 @@ class WorkSeed:
         if self.start >= self.end:
             return None
         mid = (self.start + self.end) // 2
-        return (
-            WorkSeed(self.start, mid),
-            WorkSeed(mid + 1, self.end)
-        )
+        return (WorkSeed(self.start, mid), WorkSeed(mid + 1, self.end))
 
 
 class RPCFetchError(RuntimeError):
@@ -176,14 +175,14 @@ def build_work_seeds(
 def _decode_logs(
     logs: list[EventLog],
     registry: EventRegistry,
-) -> dict[str, dict[str, list]]:
+) -> dict[str, dict[str, list[Any]]]:
     """Decode all logs into per-event columnar buffers.
 
     Returns a dict mapping event_name → {field_name → list_of_values}.
     Each event type only tracks its own fields — no padding.
     Filtered logs are silently skipped.
     """
-    buffers: dict[str, dict[str, list]] = {}
+    buffers: dict[str, dict[str, list[Any]]] = {}
 
     for ev in logs:
         if not ev.topics:
@@ -345,9 +344,7 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         buffers = _decode_logs(logs, ctx.registry)
         if ctx.stop_event is not None and ctx.stop_event.is_set():
             raise RuntimeError("writer lock lost during run")
-        written = write_chunk(
-            ctx.storage, ctx.registry, a, b, buffers, ctx.codec
-        )
+        written = write_chunk(ctx.storage, ctx.registry, a, b, buffers, ctx.codec)
 
         if ctx.print_chunk_writes:
             logger.info(

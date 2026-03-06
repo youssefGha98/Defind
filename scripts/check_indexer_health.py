@@ -7,8 +7,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
 
+from defind.core.interfaces import IChunkStorage
 from defind.storage.local import LocalChunkStorage
 from defind.storage.s3 import S3ChunkStorage
 
@@ -40,8 +40,9 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _build_storage(args: argparse.Namespace) -> tuple[Any, str]:
+def _build_storage(args: argparse.Namespace) -> tuple[IChunkStorage, str]:
     subpath = f"{args.protocol}/{args.contract}"
+    storage: IChunkStorage
     if args.s3_bucket:
         prefix = f"{args.s3_prefix.rstrip('/')}/{subpath}/" if args.s3_prefix else f"{subpath}/"
         storage = S3ChunkStorage(

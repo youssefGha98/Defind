@@ -231,9 +231,10 @@ async def test_process_interval_prints_chunk_writes_when_enabled() -> None:
     storage.exists.return_value = False
     context = _ctx(rpc=rpc, storage=storage, print_chunk_writes=True)
 
-    with patch("defind.core.use_cases.fetch_decode.write_chunk", return_value=["TestEvent/chunk_0_0.parquet"]), patch(
-        "defind.core.use_cases.fetch_decode.logger.info"
-    ) as log_mock:
+    with (
+        patch("defind.core.use_cases.fetch_decode.write_chunk", return_value=["TestEvent/chunk_0_0.parquet"]),
+        patch("defind.core.use_cases.fetch_decode.logger.info") as log_mock,
+    ):
         await process_interval(context, WorkSeed(0, 0))
 
     assert log_mock.call_count >= 2

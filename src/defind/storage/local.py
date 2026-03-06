@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,10 +45,7 @@ class LocalChunkStorage(IChunkStorage):
         base = self.root / prefix
         if not base.exists():
             return []
-        return [
-            str(p.relative_to(self.root))
-            for p in base.rglob("*.parquet")
-        ]
+        return [str(p.relative_to(self.root)) for p in base.rglob("*.parquet")]
 
     def delete(self, key: str) -> None:
         path = self._full_path(key)
@@ -56,14 +54,14 @@ class LocalChunkStorage(IChunkStorage):
         except FileNotFoundError:
             pass
 
-    def write_json(self, key: str, payload: dict) -> None:
+    def write_json(self, key: str, payload: dict[str, Any]) -> None:
         out_path = self._full_path(key)
         out_path.parent.mkdir(exist_ok=True, parents=True)
         tmp_path = out_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         os.replace(tmp_path, out_path)
 
-    def create_json_if_absent(self, key: str, payload: dict) -> bool:
+    def create_json_if_absent(self, key: str, payload: dict[str, Any]) -> bool:
         out_path = self._full_path(key)
         out_path.parent.mkdir(exist_ok=True, parents=True)
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -84,7 +82,7 @@ class LocalChunkStorage(IChunkStorage):
             raise
         return True
 
-    def read_json(self, key: str) -> dict | None:
+    def read_json(self, key: str) -> dict[str, Any] | None:
         path = self._full_path(key)
         if not path.exists():
             return None

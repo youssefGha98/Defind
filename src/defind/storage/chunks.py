@@ -20,6 +20,7 @@ No padding — each event buffer only tracks its own fields.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 
@@ -79,9 +80,7 @@ def empty_table_for_spec(spec: EventSpec) -> pa.Table:
     Includes base columns plus all projection columns, all with 0 rows.
     """
     fields = [pa.field(name, dtype) for name, dtype in BASE_FIELDS]
-    arrays: dict[str, pa.Array] = {
-        name: pa.array([], type=dtype) for name, dtype in BASE_FIELDS
-    }
+    arrays: dict[str, pa.Array] = {name: pa.array([], type=dtype) for name, dtype in BASE_FIELDS}
     for col_name in sorted(spec.projection.keys()):
         fields.append(pa.field(col_name, pa.string()))
         arrays[col_name] = pa.array([], type=pa.string())
@@ -89,7 +88,7 @@ def empty_table_for_spec(spec: EventSpec) -> pa.Table:
     return pa.Table.from_pydict(arrays, schema=schema)
 
 
-def _build_table(ev_buf: dict[str, list], spec: EventSpec) -> pa.Table:
+def _build_table(ev_buf: dict[str, list[Any]], spec: EventSpec) -> pa.Table:
     """Build a sorted Arrow table directly from a per-event columnar buffer.
 
     ev_buf contains base fields + projection keys as plain Python lists.
@@ -98,12 +97,12 @@ def _build_table(ev_buf: dict[str, list], spec: EventSpec) -> pa.Table:
     n = len(ev_buf["block_number"])
     fields = [pa.field(name, dtype) for name, dtype in BASE_FIELDS]
     arrays: dict[str, pa.Array] = {
-        "block_number":    pa.array(ev_buf["block_number"],    type=pa.uint64()),
+        "block_number": pa.array(ev_buf["block_number"], type=pa.uint64()),
         "block_timestamp": pa.array(ev_buf["block_timestamp"], type=pa.uint64()),
-        "tx_hash":         pa.array(ev_buf["tx_hash"],         type=pa.string()),
-        "log_index":       pa.array(ev_buf["log_index"],       type=pa.uint64()),
-        "contract":        pa.array(ev_buf["contract"],        type=pa.string()),
-        "event":           pa.array([spec.name] * n,           type=pa.string()),
+        "tx_hash": pa.array(ev_buf["tx_hash"], type=pa.string()),
+        "log_index": pa.array(ev_buf["log_index"], type=pa.uint64()),
+        "contract": pa.array(ev_buf["contract"], type=pa.string()),
+        "event": pa.array([spec.name] * n, type=pa.string()),
     }
     for out_key in sorted(spec.projection.keys()):
         fields.append(pa.field(out_key, pa.string()))
@@ -129,10 +128,7 @@ def chunk_is_done(
     guaranteeing that a partial crash (some events written, some not) is
     detected and the chunk is reprocessed.
     """
-    return all(
-        storage.exists(chunk_key(ev, from_block, to_block))
-        for ev in event_names
-    )
+    return all(storage.exists(chunk_key(ev, from_block, to_block)) for ev in event_names)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +141,7 @@ def write_chunk(
     registry: EventRegistry,
     from_block: int,
     to_block: int,
-    buffers: dict[str, dict[str, list]],
+    buffers: dict[str, dict[str, list[Any]]],
     codec: str = "lz4",
 ) -> list[str]:
     """Write one Parquet file per event type for this block range.

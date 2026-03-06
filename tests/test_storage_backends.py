@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -29,7 +30,7 @@ class _FakeOutputStream:
     def __enter__(self) -> _FakeOutputStream:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
         if exc_type is None:
             self._store[self._path] = bytes(self._buf)
         return False
@@ -45,7 +46,7 @@ class _FakeInputFile:
     def __enter__(self) -> _FakeInputFile:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
         return False
 
     def read(self) -> bytes:
@@ -144,7 +145,7 @@ def test_local_chunk_storage_create_json_if_absent(tmp_path: Path) -> None:
 
 def test_local_chunk_storage_read_json_invalid_returns_none(tmp_path: Path) -> None:
     storage = LocalChunkStorage(tmp_path / "chunks")
-    p = (tmp_path / "chunks" / "_meta" / "coverage_index.json")
+    p = tmp_path / "chunks" / "_meta" / "coverage_index.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{broken", encoding="utf-8")
 
@@ -153,9 +154,10 @@ def test_local_chunk_storage_read_json_invalid_returns_none(tmp_path: Path) -> N
 
 def test_s3_chunk_storage_write_table_delegates_to_pyarrow() -> None:
     fake_fs = _FakeS3FS()
-    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs), patch(
-        "defind.storage.s3.pq.write_table"
-    ) as write_table_mock:
+    with (
+        patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs),
+        patch("defind.storage.s3.pq.write_table") as write_table_mock,
+    ):
         storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
         table = pa.table({"a": [1]})
         storage.write_table("Mint/chunk_0000000000_0000000001.parquet", table, "lz4")
@@ -281,3 +283,92 @@ def test_s3_chunk_storage_retries_exists_then_succeeds() -> None:
         storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=1, retry_backoff_s=0.01)
         assert storage.exists("Mint/chunk_0000000000_0000000001.parquet") is True
     sleep_mock.assert_called_once()
+
+
+def test_s3_chunk_storage_list_incomplete_multipart_uploads_filters_by_age_and_prefix() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    now = datetime.now(timezone.utc)
+    storage._s3_client = MagicMock()
+    storage._s3_client.list_multipart_uploads.return_value = {
+        "Uploads": [
+            {
+                "Key": "proto/contract/CollectProtocol/chunk_old.parquet",
+                "UploadId": "u-old",
+                "Initiated": now - timedelta(minutes=10),
+            },
+            {
+                "Key": "proto/contract/CollectProtocol/chunk_recent.parquet",
+                "UploadId": "u-recent",
+                "Initiated": now - timedelta(seconds=10),
+            },
+        ],
+        "IsTruncated": False,
+    }
+
+    uploads = storage.list_incomplete_multipart_uploads(
+        key_prefix="CollectProtocol/",
+        older_than_s=60,
+    )
+    assert [u["key"] for u in uploads] == ["CollectProtocol/chunk_old.parquet"]
+    assert uploads[0]["upload_id"] == "u-old"
+    storage._s3_client.list_multipart_uploads.assert_called_once_with(
+        Bucket="bucket",
+        Prefix="proto/contract/CollectProtocol/",
+    )
+
+
+def test_s3_chunk_storage_abort_incomplete_multipart_upload_is_idempotent_on_missing_upload() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    storage._s3_client = MagicMock()
+    storage._s3_client.abort_multipart_upload.side_effect = RuntimeError("NoSuchUpload")
+    assert storage.abort_incomplete_multipart_upload(key="CollectProtocol/chunk_x.parquet", upload_id="u-1") is False
+
+
+def test_s3_chunk_storage_cleanup_incomplete_multipart_uploads_dry_run_does_not_abort() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    now = datetime.now(timezone.utc)
+    storage._s3_client = MagicMock()
+    storage._s3_client.list_multipart_uploads.return_value = {
+        "Uploads": [
+            {"Key": "proto/contract/CollectProtocol/chunk_a.parquet", "UploadId": "u-a", "Initiated": now},
+            {"Key": "proto/contract/CollectProtocol/chunk_b.parquet", "UploadId": "u-b", "Initiated": now},
+        ],
+        "IsTruncated": False,
+    }
+
+    summary = storage.cleanup_incomplete_multipart_uploads(key_prefix="CollectProtocol/", dry_run=True)
+    assert summary["found"] == 2
+    assert summary["aborted"] == 0
+    assert summary["failed"] == 0
+    storage._s3_client.abort_multipart_upload.assert_not_called()
+
+
+def test_s3_chunk_storage_cleanup_incomplete_multipart_uploads_apply_mode_aborts_all() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    now = datetime.now(timezone.utc)
+    storage._s3_client = MagicMock()
+    storage._s3_client.list_multipart_uploads.return_value = {
+        "Uploads": [
+            {"Key": "proto/contract/CollectProtocol/chunk_a.parquet", "UploadId": "u-a", "Initiated": now},
+            {"Key": "proto/contract/CollectProtocol/chunk_b.parquet", "UploadId": "u-b", "Initiated": now},
+        ],
+        "IsTruncated": False,
+    }
+
+    summary = storage.cleanup_incomplete_multipart_uploads(key_prefix="CollectProtocol/", dry_run=False)
+    assert summary["found"] == 2
+    assert summary["aborted"] == 2
+    assert summary["failed"] == 0
+    assert storage._s3_client.abort_multipart_upload.call_count == 2

@@ -4,7 +4,7 @@ import contextlib
 import contextvars
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, MutableMapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,10 +51,14 @@ class JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
 
 
-class ContextLoggerAdapter(logging.LoggerAdapter):
+class ContextLoggerAdapter(logging.LoggerAdapter[logging.Logger]):
     """Logger adapter that enriches log records with bound async context."""
 
-    def process(self, msg: Any, kwargs: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    def process(
+        self,
+        msg: Any,
+        kwargs: MutableMapping[str, Any],
+    ) -> tuple[Any, MutableMapping[str, Any]]:
         merged = _context_snapshot()
         if self.extra:
             merged.update(self.extra)
