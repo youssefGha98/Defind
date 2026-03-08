@@ -83,8 +83,9 @@ class IChunkStorage(Protocol):
         """
         List all keys that start with the given prefix.
 
-        Returns relative keys (not full paths).
+        Returns relative keys (not full paths) for any stored object type.
         Example: list_keys("Mint/") → ["Mint/chunk_0000000100_0000005099.parquet", ...]
+        Example: list_keys("_meta/") → ["_meta/coverage_index.json", ...]
         """
         ...
 
@@ -98,4 +99,12 @@ class IChunkStorage(Protocol):
 
     def read_json(self, key: str) -> dict[str, Any] | None:
         """Read a JSON payload from a relative key, or None if missing/invalid."""
+        ...
+
+    def write_text(self, key: str, payload: str) -> None:
+        """Write a UTF-8 text payload to a relative key."""
+        ...
+
+    def read_text(self, key: str) -> str | None:
+        """Read a UTF-8 text payload from a relative key, or None if missing/invalid."""
         ...

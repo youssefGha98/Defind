@@ -10,10 +10,13 @@
 #   universal: false
 
 -e file:.
+annotated-doc==0.0.4
+    # via fastapi
 annotated-types==0.7.0
     # via pydantic
 anyio==4.10.0
     # via httpx
+    # via starlette
 asttokens==3.0.0
     # via stack-data
 certifi==2025.8.3
@@ -21,6 +24,7 @@ certifi==2025.8.3
     # via httpx
 click==8.2.1
     # via defind
+    # via uvicorn
 comm==0.2.3
     # via ipykernel
 cytoolz==1.0.1
@@ -46,8 +50,11 @@ eth-utils==5.3.1
     # via eth-abi
 executing==2.2.0
     # via stack-data
+fastapi==0.135.1
+    # via defind
 h11==0.16.0
     # via httpcore
+    # via uvicorn
 h2==4.3.0
     # via httpx
 hpack==4.1.0
@@ -111,6 +118,7 @@ pycryptodome==3.23.0
     # via eth-hash
 pydantic==2.11.7
     # via eth-utils
+    # via fastapi
 pydantic-core==2.33.2
     # via pydantic
 pygments==2.19.2
@@ -137,6 +145,8 @@ sniffio==1.3.1
     # via anyio
 stack-data==0.6.3
     # via ipython
+starlette==0.52.1
+    # via fastapi
 toolz==1.0.0
     # via cytoolz
 tornado==6.5.2
@@ -151,12 +161,17 @@ traitlets==5.14.3
 typing-extensions==4.15.0
     # via anyio
     # via eth-typing
+    # via fastapi
     # via pydantic
     # via pydantic-core
+    # via starlette
     # via typing-inspection
-typing-inspection==0.4.1
+typing-inspection==0.4.2
+    # via fastapi
     # via pydantic
 tzdata==2025.2
     # via pandas
+uvicorn==0.41.0
+    # via defind
 wcwidth==0.2.13
     # via prompt-toolkit

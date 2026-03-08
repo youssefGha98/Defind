@@ -224,6 +224,27 @@ async def test_process_interval_does_not_split_on_http_414_without_range_markers
 
 
 @pytest.mark.asyncio
+async def test_process_interval_retries_on_retryable_network_error_then_succeeds() -> None:
+    req = httpx.Request("POST", "http://localhost:8545")
+    err = httpx.ReadTimeout("", request=req)
+
+    rpc = AsyncMock()
+    rpc.get_logs = AsyncMock(side_effect=[err, []])
+    storage = MagicMock()
+    storage.exists.return_value = False
+    storage.write_table.return_value = None
+    context = _ctx(rpc=rpc, storage=storage)
+
+    with patch("defind.core.use_cases.fetch_decode.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        await process_interval(context, WorkSeed(0, 0))
+
+    assert rpc.get_logs.await_count == 2
+    assert context.stats.processed_ok == 1
+    assert context.stats.processed_failed == 0
+    sleep_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_process_interval_prints_chunk_writes_when_enabled() -> None:
     rpc = AsyncMock()
     rpc.get_logs = AsyncMock(return_value=[])

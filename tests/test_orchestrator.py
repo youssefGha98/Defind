@@ -16,6 +16,7 @@ from defind.core.use_cases.fetch_decode import (
     process_interval,
 )
 from defind.decoding.specs import DataFieldSpec, EventRegistry, EventSpec, ProjectionRefs, TopicFieldSpec
+from defind.indexer_request import INDEXER_REQUEST_KEY
 from defind.orchestration.orchestrator import (
     _cleanup_overlapping_intervals,
     _cleanup_redundant_old_chunks,
@@ -74,6 +75,33 @@ async def test_fetch_decode_empty_seeds(mock_rpc: Any) -> None:
 
     assert output.stats.processed_ok == 0
     assert output.stats.total_logs == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_persists_indexer_request_template(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    mock_storage = MagicMock()
+    mock_storage.exists.return_value = True
+    mock_storage.list_keys.return_value = []
+    mock_storage.read_json.return_value = None
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
+        patch("defind.orchestration.orchestrator.load_done_chunks", return_value=[]),
+        patch("defind.orchestration.orchestrator.build_work_seeds", return_value=[]),
+    ):
+        await fetch_decode(config=_base_config(s3_bucket="defind"), registry=registry)
+
+    write_json_calls = [
+        call for call in mock_storage.write_json.call_args_list if call.args and call.args[0] == INDEXER_REQUEST_KEY
+    ]
+    assert len(write_json_calls) == 1
+    payload = write_json_calls[0].args[1]
+    assert payload["request"]["protocol_slug"] == "test"
+    assert payload["request"]["contract_slug"] == "pool"
+    assert payload["request"]["registry_json"]["version"] == 1
+    assert payload["request"]["s3_bucket"] == "defind"
 
 
 @pytest.mark.asyncio
@@ -445,6 +473,26 @@ def test_plan_tail_extension_does_not_skip_hole_before_tail() -> None:
     assert seeds == [WorkSeed(100, 149), WorkSeed(250, 260)]
 
 
+def test_plan_tail_extension_rewrites_partial_tail_when_anchored_on_dataset_start() -> None:
+    seeds = _plan_seeds_with_tail_extension(
+        current_start=100,
+        current_end=699,
+        chunk_size=200,
+        done_chunks=[(100, 299), (300, 499), (500, 649)],
+    )
+    assert seeds == [WorkSeed(500, 699)]
+
+
+def test_plan_tail_extension_cannot_rewind_when_started_from_last_block() -> None:
+    seeds = _plan_seeds_with_tail_extension(
+        current_start=649,
+        current_end=699,
+        chunk_size=200,
+        done_chunks=[(100, 299), (300, 499), (500, 649)],
+    )
+    assert seeds == [WorkSeed(650, 699)]
+
+
 def test_plan_startup_small_interval_compaction_rewrites_fragmented_subchunk() -> None:
     seeds = _plan_startup_small_interval_compaction(
         anchor_start=0,
@@ -488,7 +536,7 @@ def test_cleanup_redundant_old_chunks_deletes_orphan_partials() -> None:
     storage.delete.assert_any_call("E2/chunk_0000000000_0000000099.parquet")
 
 
-def test_cleanup_overlapping_intervals_deletes_legacy_overlaps() -> None:
+def test_cleanup_overlapping_intervals_deletes_redundant_overlaps() -> None:
     storage = MagicMock()
     storage.delete.return_value = None
     storage.list_keys.side_effect = lambda prefix: {

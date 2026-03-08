@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -89,6 +90,23 @@ class _MemJsonStorage:
 
     def create_json_if_absent(self, key: str, payload: dict[str, Any]) -> bool:
         if key in self._json:
+            return False
+        self._json[key] = dict(payload)
+        return True
+
+    def read_json_with_version(self, key: str) -> tuple[dict[str, Any] | None, str | None]:
+        payload = self.read_json(key)
+        if payload is None:
+            return None, None
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return payload, raw.hex()
+
+    def write_json_if_version(self, key: str, payload: dict[str, Any], expected_version: str | None) -> bool:
+        current, current_version = self.read_json_with_version(key)
+        if current is None and expected_version is None:
+            self._json[key] = dict(payload)
+            return True
+        if current_version != expected_version:
             return False
         self._json[key] = dict(payload)
         return True
@@ -282,6 +300,25 @@ def test_writer_lock_refresh_detects_owner_loss() -> None:
         },
     )
     with pytest.raises(RuntimeError, match="writer lock lost"):
+        _refresh_writer_lock(storage=storage, lock=lock)
+
+
+def test_writer_lock_refresh_detects_compare_and_swap_loss() -> None:
+    class _FailingVersionStorage(_MemJsonStorage):
+        def write_json_if_version(self, key: str, payload: dict[str, Any], expected_version: str | None) -> bool:
+            _ = (key, payload, expected_version)
+            return False
+
+    storage = _FailingVersionStorage()
+    lock = _acquire_writer_lock(
+        storage=storage,
+        key="_meta/writer.lock.json",
+        owner_id="owner-a",
+        run_id="run-a",
+        ttl_s=120,
+    )
+
+    with pytest.raises(RuntimeError, match="writer lock changed before refresh"):
         _refresh_writer_lock(storage=storage, lock=lock)
 
 
@@ -586,6 +623,8 @@ async def test_heartbeat_loop_writes_json_and_warns_on_lag_threshold() -> None:
         target_end_block=120,
         last_indexed_block=90,
         chain_head_block=120,
+        address="0x0000000000000000000000000000000000000001",
+        rpc_url="https://rpc.example.org",
     )
 
     with (
@@ -609,4 +648,6 @@ async def test_heartbeat_loop_writes_json_and_warns_on_lag_threshold() -> None:
     assert payload["last_indexed_block"] == 90
     assert payload["chain_head_block"] == 120
     assert payload["lag_blocks"] == 30
+    assert payload["address"] == "0x0000000000000000000000000000000000000001"
+    assert payload["rpc_url"] == "https://rpc.example.org"
     assert warning_mock.call_count >= 1

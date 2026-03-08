@@ -82,6 +82,7 @@ class ProcessContext:
     force_reprocess: bool
     stats: ProcessStats
     stop_event: asyncio.Event | None = None
+    on_chunk_written: Any = None
 
 
 @dataclass(frozen=True)
@@ -101,9 +102,10 @@ class WorkSeed:
 class RPCFetchError(RuntimeError):
     """Raised when an RPC log fetch fails for a block interval."""
 
-    def __init__(self, message: str, *, splitable: bool) -> None:
+    def __init__(self, message: str, *, splitable: bool, retryable: bool = False) -> None:
         super().__init__(message)
         self.splitable = splitable
+        self.retryable = retryable
 
 
 _RANGE_ERROR_MARKERS = (
@@ -143,6 +145,14 @@ def _is_splitable_rpc_exception(exc: Exception) -> bool:
         return False
 
     return False
+
+
+def _is_retryable_rpc_exception(exc: Exception) -> bool:
+    return isinstance(exc, (httpx.TransportError, httpx.TimeoutException, asyncio.TimeoutError))
+
+
+_CHUNK_NETWORK_RETRY_ATTEMPTS = 2
+_CHUNK_NETWORK_RETRY_BACKOFF_S = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +251,17 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
     """Fetch all logs for [a, b] using concurrent step-sized sub-range calls."""
 
     sub_ranges = list(iter_chunks(a, b, ctx.step))
+    started_at = asyncio.get_running_loop().time()
+
+    logger.info(
+        "chunk_fetch_start",
+        extra={
+            "chunk_start": a,
+            "chunk_end": b,
+            "subrange_count": len(sub_ranges),
+            "step": ctx.step,
+        },
+    )
 
     async def _fetch_sub(from_b: int, to_b: int) -> list[EventLog]:
         async with ctx.sem:
@@ -255,12 +276,25 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
         results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
     except Exception as e:
         splitable = _is_splitable_rpc_exception(e)
+        retryable = _is_retryable_rpc_exception(e)
         raise RPCFetchError(
             f"RPC fetch failed for interval [{a}, {b}]",
             splitable=splitable,
+            retryable=retryable,
         ) from e
     ctx.stats.executed_subranges += len(sub_ranges)
-    return [log for batch in results for log in batch]
+    out = [log for batch in results for log in batch]
+    logger.info(
+        "chunk_fetch_complete",
+        extra={
+            "chunk_start": a,
+            "chunk_end": b,
+            "subrange_count": len(sub_ranges),
+            "log_count": len(out),
+            "duration_s": round(asyncio.get_running_loop().time() - started_at, 3),
+        },
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +318,7 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         raise RuntimeError("writer lock lost during run")
 
     stack: list[WorkSeed] = [seed]
+    retry_counts: dict[tuple[int, int], int] = {}
 
     while stack:
         if ctx.stop_event is not None and ctx.stop_event.is_set():
@@ -296,8 +331,35 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
             continue
 
         try:
+            logger.info(
+                "chunk_process_start",
+                extra={
+                    "chunk_start": a,
+                    "chunk_end": b,
+                    "force_reprocess": ctx.force_reprocess,
+                },
+            )
             logs = await _fetch_chunk_logs(ctx, a, b)
         except RPCFetchError as e:
+            retry_key = (a, b)
+            retry_attempt = retry_counts.get(retry_key, 0)
+            if e.retryable and retry_attempt < _CHUNK_NETWORK_RETRY_ATTEMPTS:
+                retry_counts[retry_key] = retry_attempt + 1
+                delay_s = _CHUNK_NETWORK_RETRY_BACKOFF_S * (2**retry_attempt)
+                logger.warning(
+                    "chunk_fetch_retry",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "attempt": retry_attempt + 1,
+                        "max_attempts": _CHUNK_NETWORK_RETRY_ATTEMPTS + 1,
+                        "retry_in_s": delay_s,
+                    },
+                )
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+                stack.append(current)
+                continue
             if not e.splitable:
                 ctx.stats.processed_failed += 1
                 logger.error(
@@ -306,6 +368,7 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
                         "chunk_start": a,
                         "chunk_end": b,
                         "splitable": False,
+                        "retryable": e.retryable,
                     },
                     exc_info=True,
                 )
@@ -369,6 +432,17 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
         ctx.stats.total_logs += len(logs)
         ctx.stats.processed_ok += 1
         ctx.stats.chunks_written += len(written)
+        if ctx.on_chunk_written is not None:
+            await ctx.on_chunk_written(a, b)
+        logger.info(
+            "chunk_process_complete",
+            extra={
+                "chunk_start": a,
+                "chunk_end": b,
+                "log_count": len(logs),
+                "files_written": len(written),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +487,7 @@ class FetchDecodeService:
         seeds: list[WorkSeed],
         force_reprocess: bool = False,
         stop_event: asyncio.Event | None = None,
+        on_chunk_written: Any = None,
     ) -> ProcessStats:
         """Execute the decoding process over the given block seeds."""
         self._validate_inputs(config, seeds)
@@ -439,6 +514,7 @@ class FetchDecodeService:
             force_reprocess=force_reprocess,
             stats=stats,
             stop_event=stop_event,
+            on_chunk_written=on_chunk_written,
         )
 
         worker_count = min(len(seeds), max(1, config.concurrency))

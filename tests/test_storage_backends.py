@@ -123,6 +123,9 @@ def test_local_chunk_storage_write_list_exists_delete(tmp_path: Path) -> None:
     storage.delete(key)
     assert storage.exists(key) is False
 
+    storage.write_json("_meta/sample.json", {"ok": True})
+    assert "_meta/sample.json" in storage.list_keys("_meta/")
+
 
 def test_local_chunk_storage_write_and_read_json(tmp_path: Path) -> None:
     storage = LocalChunkStorage(tmp_path / "chunks")
@@ -141,6 +144,22 @@ def test_local_chunk_storage_create_json_if_absent(tmp_path: Path) -> None:
     assert storage.create_json_if_absent(key, payload) is True
     assert storage.create_json_if_absent(key, payload) is False
     assert storage.read_json(key) == payload
+
+
+def test_local_chunk_storage_write_json_if_version(tmp_path: Path) -> None:
+    storage = LocalChunkStorage(tmp_path / "chunks")
+    key = "_meta/writer.lock.json"
+    storage.write_json(key, {"owner_id": "a"})
+    payload, version = storage.read_json_with_version(key)
+
+    assert payload == {"owner_id": "a"}
+    assert version is not None
+    assert storage.write_json_if_version(key, {"owner_id": "b"}, version) is True
+
+    _, stale_version = storage.read_json_with_version(key)
+    assert stale_version is not None
+    assert storage.write_json_if_version(key, {"owner_id": "c"}, version) is False
+    assert storage.read_json(key) == {"owner_id": "b"}
 
 
 def test_local_chunk_storage_read_json_invalid_returns_none(tmp_path: Path) -> None:
@@ -177,7 +196,32 @@ def test_s3_chunk_storage_exists_and_list_keys() -> None:
 
     assert storage.exists("Mint/chunk_0000000000_0000000001.parquet") is True
     assert storage.exists("Mint/chunk_9999999999_9999999999.parquet") is False
-    assert storage.list_keys("Mint/") == ["Mint/chunk_0000000000_0000000001.parquet"]
+    assert storage.list_keys("Mint/") == [
+        "Mint/chunk_0000000000_0000000001.parquet",
+        "Mint/notes.txt",
+    ]
+
+
+def test_s3_chunk_storage_list_keys_missing_prefix_returns_empty_without_retry() -> None:
+    fake_fs = _FakeS3FS()
+    original_get_file_info = fake_fs.get_file_info
+
+    def _missing_prefix(target: Any) -> Any:
+        if hasattr(target, "base_dir"):
+            raise FileNotFoundError(
+                "[Errno 2] Path does not exist 'bucket/proto/contract/Mint/'. Detail: [errno 2] No such file or directory"
+            )
+        return original_get_file_info(target)
+
+    with (
+        patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs),
+        patch("defind.storage.s3.time.sleep") as sleep_mock,
+    ):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=3, retry_backoff_s=0.01)
+        with patch.object(fake_fs, "get_file_info", side_effect=_missing_prefix):
+            assert storage.list_keys("Mint/") == []
+
+    sleep_mock.assert_not_called()
 
 
 def test_s3_chunk_storage_exists_and_list_fail_loud_on_fs_error() -> None:
@@ -233,6 +277,34 @@ def test_s3_chunk_storage_create_json_if_absent_uses_conditional_put() -> None:
 
     assert storage.create_json_if_absent("_meta/writer.lock.json", {"owner_id": "a"}) is True
     storage._s3_client.put_object.assert_called_once()
+
+
+def test_s3_chunk_storage_read_json_with_version_and_conditional_write() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    body = MagicMock()
+    body.read.return_value = json.dumps({"owner_id": "a"}).encode("utf-8")
+    storage._s3_client = MagicMock()
+    storage._s3_client.get_object.return_value = {
+        "Body": body,
+        "ETag": '"etag-1"',
+    }
+    storage._s3_client.put_object.return_value = None
+
+    payload, version = storage.read_json_with_version("_meta/writer.lock.json")
+    assert payload == {"owner_id": "a"}
+    assert version == '"etag-1"'
+
+    assert storage.write_json_if_version("_meta/writer.lock.json", {"owner_id": "b"}, version) is True
+    storage._s3_client.put_object.assert_called_with(
+        Bucket="bucket",
+        Key="proto/contract/_meta/writer.lock.json",
+        Body=json.dumps({"owner_id": "b"}, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+        IfMatch='"etag-1"',
+    )
 
 
 def test_s3_chunk_storage_create_json_if_absent_returns_false_on_precondition_failed() -> None:

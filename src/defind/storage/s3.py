@@ -1,3 +1,4 @@
+# mypy: disable-error-code="import-untyped,import-not-found"
 from __future__ import annotations
 
 import json
@@ -126,6 +127,8 @@ class S3ChunkStorage(IChunkStorage):
                 self._s3_client = None
 
     def _is_retryable_exception(self, exc: Exception) -> bool:
+        if self._is_not_found_exception(exc):
+            return False
         msg = str(exc).lower()
         if any(marker in msg for marker in _RETRYABLE_MARKERS):
             return True
@@ -188,6 +191,9 @@ class S3ChunkStorage(IChunkStorage):
             raise RuntimeError("S3 operation requires boto3/botocore client support; install boto3 for this backend")
         return self._s3_client
 
+    def supports_atomic_locks(self) -> bool:
+        return self._s3_client is not None
+
     def _normalize_relative_key(self, key: str) -> str:
         normalized = key.lstrip("/")
         if self.prefix and normalized.startswith(self.prefix):
@@ -245,7 +251,7 @@ class S3ChunkStorage(IChunkStorage):
             raise
 
     def list_keys(self, prefix: str) -> list[str]:
-        """List all .parquet keys under `self.prefix + prefix`."""
+        """List all file keys under `self.prefix + prefix`."""
         s3_prefix_path = f"{self.bucket}/{self.prefix}{prefix}"
         selector = pa_fs.FileSelector(s3_prefix_path, recursive=True)
         try:
@@ -265,7 +271,7 @@ class S3ChunkStorage(IChunkStorage):
         keys = []
         full_prefix = f"{self.bucket}/{self.prefix}"
         for info in file_infos:
-            if info.type == pa_fs.FileType.File and info.path.endswith(".parquet"):
+            if info.type == pa_fs.FileType.File:
                 # Strip bucket/prefix to get the relative key
                 rel = info.path.removeprefix(full_prefix)
                 keys.append(rel)
@@ -293,6 +299,16 @@ class S3ChunkStorage(IChunkStorage):
 
         self._with_retries("write_json", _do_write)
 
+    def write_text(self, key: str, payload: str) -> None:
+        s3_path = self._s3_path(key)
+        raw = payload.encode("utf-8")
+
+        def _do_write() -> None:
+            with self._fs.open_output_stream(s3_path) as out:
+                out.write(raw)
+
+        self._with_retries("write_text", _do_write)
+
     def create_json_if_absent(self, key: str, payload: dict[str, Any]) -> bool:
         client = self._s3_client
         if client is None:
@@ -315,6 +331,63 @@ class S3ChunkStorage(IChunkStorage):
 
         try:
             self._with_retries("create_json_if_absent", _put_conditional)
+            return True
+        except Exception as exc:
+            if self._is_precondition_failed_exception(exc):
+                return False
+            raise
+
+    def read_json_with_version(self, key: str) -> tuple[dict[str, Any] | None, str | None]:
+        client = self._require_s3_client()
+        s3_key = f"{self.prefix}{key}"
+
+        def _get_object() -> dict[str, Any]:
+            return cast(dict[str, Any], client.get_object(Bucket=self.bucket, Key=s3_key))
+
+        try:
+            response = self._with_retries("read_json_with_version", _get_object)
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return None, None
+            logger.warning(
+                "s3_read_json_with_version_failed path=s3://%s err=%s",
+                f"{self.bucket}/{s3_key}",
+                exc,
+                extra={"path": f"s3://{self.bucket}/{s3_key}", "error": str(exc)},
+            )
+            raise
+
+        body = response.get("Body")
+        etag = cast(str | None, response.get("ETag"))
+        if body is None:
+            return None, etag
+        raw = cast(bytes, body.read())
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, etag
+        return (cast(dict[str, Any], data) if isinstance(data, dict) else None), etag
+
+    def write_json_if_version(self, key: str, payload: dict[str, Any], expected_version: str | None) -> bool:
+        client = self._require_s3_client()
+        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        s3_key = f"{self.prefix}{key}"
+
+        def _put_conditional() -> None:
+            kwargs: dict[str, Any] = {
+                "Bucket": self.bucket,
+                "Key": s3_key,
+                "Body": raw,
+                "ContentType": "application/json",
+            }
+            if expected_version is None:
+                kwargs["IfNoneMatch"] = "*"
+            else:
+                kwargs["IfMatch"] = expected_version
+            client.put_object(**kwargs)
+
+        try:
+            self._with_retries("write_json_if_version", _put_conditional)
             return True
         except Exception as exc:
             if self._is_precondition_failed_exception(exc):
@@ -494,8 +567,34 @@ class S3ChunkStorage(IChunkStorage):
             data = json.loads(raw.decode("utf-8"))
             return cast(dict[str, Any], data) if isinstance(data, dict) else None
         except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return None
             logger.warning(
                 "s3_read_json_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
+            return None
+
+    def read_text(self, key: str) -> str | None:
+        s3_path = self._s3_path(key)
+        try:
+            info = self._with_retries("read_text_info", lambda: self._fs.get_file_info(s3_path))
+            if info.type != pa_fs.FileType.File:
+                return None
+
+            def _read_raw() -> bytes:
+                with self._fs.open_input_file(s3_path) as inp:
+                    return cast(bytes, inp.read())
+
+            raw = self._with_retries("read_text", _read_raw)
+            return raw.decode("utf-8")
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return None
+            logger.warning(
+                "s3_read_text_failed path=s3://%s err=%s",
                 s3_path,
                 exc,
                 extra={"path": f"s3://{s3_path}", "error": str(exc)},

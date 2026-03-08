@@ -132,6 +132,74 @@ Environment variables supported by the cleanup script:
 - `S3_SECRET_KEY`
 - `S3_REGION`
 
+### Ops API
+
+Run the API server:
+
+```bash
+source .venv/bin/activate
+defind-ops-api
+```
+
+Equivalent script command:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/run_api_server.py
+```
+
+Main endpoints:
+- `GET /status`
+- `GET /datasets`
+- `POST /datasets`
+- `GET /datasets/{protocol}/{contract}`
+- `PATCH /datasets/{protocol}/{contract}`
+- `GET /datasets/{protocol}/{contract}/jobs`
+- `POST /datasets/{protocol}/{contract}/jobs`
+- `GET /datasets/{protocol}/{contract}/jobs/{job_id}`
+- `POST /datasets/{protocol}/{contract}/jobs/{job_id}/stop`
+- `POST /datasets/{protocol}/{contract}/jobs/{job_id}/restart`
+- `GET /datasets/{protocol}/{contract}/jobs/{job_id}/logs`
+- `GET /datasets/{protocol}/{contract}/jobs/{job_id}/logs/stream`
+- `GET /datasets/{protocol}/{contract}/coverage`
+- `POST /indexer/abi/etherscan`
+
+Main env vars:
+- `DEFIND_API_OUT_ROOT` (default `./data`)
+- `DEFIND_API_PORT` (default `8000`)
+- `DEFIND_API_CORS_ORIGINS` (default `*`)
+- `DEFIND_API_ETHERSCAN_API_URL` (default `https://api.etherscan.io/v2/api`)
+- `DEFIND_API_ETHERSCAN_CHAIN_ID` (default `1`)
+- `DEFIND_API_EVENT_HISTORY_PREFIX` (default `_meta/event_history/`)
+- `DEFIND_API_EVENT_HISTORY_LIMIT` (default `10000`)
+- `ETHERSCAN_API_KEY` (optional)
+- `S3_BUCKET`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` (for S3 mode)
+
+Minimal dataset creation payload:
+
+```json
+{
+  "protocol": "uniswap",
+  "contract": "usdc_weth",
+  "contract_address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+  "chain_id": 1,
+  "rpc_url": "https://ethereum-rpc.publicnode.com",
+  "abi_path": "abis/cl_pool.json",
+  "start_block": 12376729,
+  "step": 7000,
+  "chunk_size": 200000,
+  "storage": "s3"
+}
+```
+
+Minimal job start payload:
+
+```json
+{
+  "mode": "both",
+  "concurrency": 25
+}
+```
+
 ## Systemd setup (VPS)
 
 Files are in `ops/systemd/`.
@@ -170,5 +238,5 @@ defind version
 source .venv/bin/activate
 ruff check src scripts examples tests
 pytest -q
-mypy src scripts examples
+mypy .
 ```

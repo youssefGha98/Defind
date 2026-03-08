@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from eth_utils.abi import event_signature_to_log_topic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from defind.decoding.registry import add_event_spec
 from defind.decoding.specs import DataFieldSpec, EventRegistry, EventSpec, ProjectionRefs, TopicFieldSpec
@@ -83,7 +83,20 @@ def _load_abi(abi: AbiSpec) -> AbiJson:
 
 def get_events_from_abi(abi: AbiSpec) -> dict[str, AbiEvent]:
     abi = _load_abi(abi)
-    return {entry["name"]: AbiEvent.model_validate(entry) for entry in abi if entry["type"] == "event"}
+    events: dict[str, AbiEvent] = {}
+    for idx, entry in enumerate(abi):
+        if not isinstance(entry, dict):
+            raise ValueError(f"ABI entry at index {idx} must be a JSON object")
+        if "type" not in entry:
+            raise ValueError(f"ABI entry at index {idx} is missing 'type'")
+        if entry.get("type") != "event":
+            continue
+        try:
+            event = AbiEvent.model_validate(entry)
+        except ValidationError as exc:
+            raise ValueError(f"invalid event ABI entry at index {idx}: {exc}") from exc
+        events[event.name] = event
+    return events
 
 
 def make_event_registry_from_events(events: Iterable[AbiEvent]) -> EventRegistry:

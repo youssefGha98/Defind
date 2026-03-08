@@ -14,8 +14,9 @@ import os
 import socket
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from defind.clients.rpc import RPC
 from defind.core.config import OrchestratorConfig
@@ -29,6 +30,7 @@ from defind.core.use_cases.fetch_decode import (
 )
 from defind.decoding.registry import EventRegistryProvider
 from defind.decoding.specs import EventRegistry
+from defind.indexer_request import build_request_payload_from_config, write_indexer_request
 from defind.observability import bind_log_context, configure_logging, get_logger
 from defind.orchestration.utils import (
     load_done_chunks,
@@ -70,6 +72,8 @@ class _ProgressState:
     target_end_block: int
     last_indexed_block: int
     chain_head_block: int | None
+    address: str
+    rpc_url: str
 
 
 @dataclass(slots=True)
@@ -110,6 +114,8 @@ async def _heartbeat_loop(
             "last_indexed_block": progress.last_indexed_block,
             "chain_head_block": progress.chain_head_block,
             "lag_blocks": lag_blocks,
+            "address": progress.address,
+            "rpc_url": progress.rpc_url,
         }
 
         try:
@@ -146,6 +152,45 @@ def _read_writer_lock(storage: IChunkStorage, key: str) -> dict[str, Any] | None
     if not isinstance(data, dict):
         raise RuntimeError(f"writer lock exists but is unreadable key={key}")
     return data
+
+
+def _read_json_with_version(
+    storage: IChunkStorage,
+    key: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    read_with_version = getattr(storage, "read_json_with_version", None)
+    if callable(read_with_version) and hasattr(type(storage), "read_json_with_version"):
+        result = read_with_version(key)
+        if isinstance(result, tuple) and len(result) == 2:
+            data, version = result
+            return cast(dict[str, Any] | None, data), cast(str | None, version)
+    return storage.read_json(key), None
+
+
+def _write_json_if_version(
+    storage: IChunkStorage,
+    key: str,
+    payload: dict[str, Any],
+    expected_version: str | None,
+) -> bool:
+    write_if_version = getattr(storage, "write_json_if_version", None)
+    if callable(write_if_version) and hasattr(type(storage), "write_json_if_version"):
+        return bool(write_if_version(key, payload, expected_version))
+    storage.write_json(key, payload)
+    return True
+
+
+def _read_writer_lock_with_version(
+    storage: IChunkStorage,
+    key: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    exists = storage.exists(key)
+    if not exists:
+        return None, None
+    data, version = _read_json_with_version(storage, key)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"writer lock exists but is unreadable key={key}")
+    return data, version
 
 
 def _lock_expiry(lock_payload: dict[str, Any]) -> int:
@@ -193,15 +238,19 @@ def _acquire_writer_lock(
     }
     created = _try_create_lock_if_absent(storage=storage, key=key, payload=payload)
     if not created:
-        current = _read_writer_lock(storage, key)
+        current, current_version = _read_writer_lock_with_version(storage, key)
         current_owner = str((current or {}).get("owner_id") or "")
         expires_at = _lock_expiry(current or {})
         if current_owner and current_owner != owner_id and expires_at > now:
             raise RuntimeError(f"writer lock is already held key={key} owner={current_owner} expires_at_s={expires_at}")
 
-        # Stale lock takeover path.
-        storage.delete(key)
-        created = _try_create_lock_if_absent(storage=storage, key=key, payload=payload)
+        # Replace the stale lock only if the observed version is still current.
+        created = _write_json_if_version(
+            storage=storage,
+            key=key,
+            payload=payload,
+            expected_version=current_version,
+        )
         if not created:
             check_existing = _read_writer_lock(storage, key)
             observed = None if not isinstance(check_existing, dict) else check_existing.get("owner_id")
@@ -227,7 +276,7 @@ def _refresh_writer_lock(
     lock: _WriterLock,
 ) -> None:
     now = int(time.time())
-    current = _read_writer_lock(storage, lock.key)
+    current, current_version = _read_writer_lock_with_version(storage, lock.key)
     if not isinstance(current, dict):
         raise RuntimeError(f"writer lock disappeared key={lock.key}")
 
@@ -245,7 +294,14 @@ def _refresh_writer_lock(
         "refreshed_at_s": now,
         "expires_at_s": now + lock.ttl_s,
     }
-    storage.write_json(lock.key, payload)
+    updated = _write_json_if_version(
+        storage=storage,
+        key=lock.key,
+        payload=payload,
+        expected_version=current_version,
+    )
+    if not updated:
+        raise RuntimeError(f"writer lock changed before refresh key={lock.key}")
     check = _read_writer_lock(storage, lock.key)
     if not isinstance(check, dict) or str(check.get("owner_id") or "") != lock.owner_id:
         observed = None if not isinstance(check, dict) else check.get("owner_id")
@@ -736,6 +792,7 @@ async def fetch_decode(
     *,
     config: OrchestratorConfig,
     registry: EventRegistry,
+    on_chunk_written: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> FetchDecodeOutput:
     """Convenience wrapper: wires concrete implementations and runs the pipeline.
 
@@ -790,6 +847,14 @@ async def fetch_decode(
             storage, contract_dir = _build_storage(config)
             effective_chunk_size = config.chunk_size if config.chunk_size is not None else config.step
             _validate_runtime_config(config=config, effective_chunk_size=effective_chunk_size)
+            try:
+                write_indexer_request(
+                    storage=storage,
+                    request_payload=build_request_payload_from_config(config=config, registry=registry),
+                    source="orchestrator",
+                )
+            except Exception as exc:
+                logger.warning("indexer_request_write_failed", extra={"error": str(exc)})
 
             if config.single_writer_guard:
                 owner_id = f"{socket.gethostname()}:{os.getpid()}:{run_id}"
@@ -845,6 +910,8 @@ async def fetch_decode(
                 chain_head_block=(
                     end if isinstance(config.end_block, str) and config.end_block.lower() == "latest" else None
                 ),
+                address=config.address,
+                rpc_url=config.rpc_url,
             )
 
             if config.heartbeat_interval_s > 0:
@@ -892,14 +959,14 @@ async def fetch_decode(
 
             progress.last_indexed_block = _last_indexed_block(done_chunks_state, start=start)
 
-            # One-shot compaction of legacy overlaps created by interrupted runs.
+            # One-shot compaction of overlapping chunks left by interrupted runs.
             deleted_contained = _cleanup_overlapping_intervals(
                 storage=storage,
                 event_names=event_names,
             )
             if deleted_contained:
                 logger.warning(
-                    "legacy_overlap_cleanup",
+                    "startup_overlap_cleanup",
                     extra={"deleted_intervals": len(deleted_contained)},
                 )
                 done_chunks_state, _ = _load_done_chunks_with_index_fallback(storage, event_names)
@@ -919,12 +986,13 @@ async def fetch_decode(
                     extra={"seed_count": len(startup_compaction_seeds)},
                 )
                 delta_stats = await service.run(
-                    config=domain_config,
-                    storage=storage,
-                    seeds=startup_compaction_seeds,
-                    force_reprocess=True,
-                    stop_event=writer_lock_lost_event if config.single_writer_guard else None,
-                )
+                        config=domain_config,
+                        storage=storage,
+                        seeds=startup_compaction_seeds,
+                        force_reprocess=True,
+                        stop_event=writer_lock_lost_event if config.single_writer_guard else None,
+                        on_chunk_written=on_chunk_written,
+                    )
                 _merge_stats(total_stats, delta_stats)
                 _cleanup_redundant_old_chunks(
                     storage=storage,
@@ -965,6 +1033,7 @@ async def fetch_decode(
                             seeds=reorg_seeds,
                             force_reprocess=True,
                             stop_event=writer_lock_lost_event if config.single_writer_guard else None,
+                            on_chunk_written=on_chunk_written,
                         )
                         _merge_stats(total_stats, delta_stats)
 
@@ -1004,6 +1073,18 @@ async def fetch_decode(
                         seeds=seeds,
                         force_reprocess=False,
                         stop_event=writer_lock_lost_event if config.single_writer_guard else None,
+                        on_chunk_written=on_chunk_written,
+                    )
+                    logger.info(
+                        "seed_batch_complete",
+                        extra={
+                            "seed_count": len(seeds),
+                            "processed_ok": delta_stats.processed_ok,
+                            "processed_failed": delta_stats.processed_failed,
+                            "chunks_written": delta_stats.chunks_written,
+                            "total_logs": delta_stats.total_logs,
+                            "executed_subranges": delta_stats.executed_subranges,
+                        },
                     )
                     _merge_stats(total_stats, delta_stats)
                     _cleanup_redundant_old_chunks(

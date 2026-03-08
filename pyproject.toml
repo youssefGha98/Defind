@@ -17,6 +17,8 @@ dependencies = [
     "eth-hash[pycryptodome]>=0.7.1",
     "duckdb>=1.4.2",
     "dotenv>=0.9.9",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"
@@ -61,6 +63,7 @@ packages = ["src/defind"]
 
 [project.scripts]
 defind = "defind.cli:cli"
+defind-ops-api = "defind.api.server:main"
 
 [tool.ruff]
 line-length = 120
@@ -85,4 +88,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
