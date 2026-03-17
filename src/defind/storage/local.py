@@ -13,6 +13,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from defind.core.interfaces import IChunkStorage
+from defind.observability import get_logger
+
+logger = get_logger(__name__)
 
 
 class LocalChunkStorage(IChunkStorage):
@@ -109,10 +112,17 @@ class LocalChunkStorage(IChunkStorage):
         if not path.exists():
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else None
-        except Exception:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
+        except OSError:
+            raise
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("local_read_json_invalid", extra={"path": str(path)})
+            return None
+        return data if isinstance(data, dict) else None
 
     def read_text(self, key: str) -> str | None:
         path = self._full_path(key)
@@ -120,8 +130,23 @@ class LocalChunkStorage(IChunkStorage):
             return None
         try:
             return path.read_text(encoding="utf-8")
-        except Exception:
+        except FileNotFoundError:
             return None
+        except UnicodeDecodeError:
+            logger.warning("local_read_text_invalid_encoding", extra={"path": str(path)})
+            return None
+        except OSError:
+            raise
+
+    def is_valid_parquet(self, key: str) -> bool:
+        path = self._full_path(key)
+        if not path.exists():
+            return False
+        try:
+            pq.read_metadata(path)
+        except Exception:
+            return False
+        return True
 
     def read_json_with_version(self, key: str) -> tuple[dict[str, Any] | None, str | None]:
         path = self._full_path(key)

@@ -171,6 +171,15 @@ def test_local_chunk_storage_read_json_invalid_returns_none(tmp_path: Path) -> N
     assert storage.read_json("_meta/coverage_index.json") is None
 
 
+def test_local_chunk_storage_read_text_invalid_encoding_returns_none(tmp_path: Path) -> None:
+    storage = LocalChunkStorage(tmp_path / "chunks")
+    p = tmp_path / "chunks" / "_meta" / "broken.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\xff\xfe")
+
+    assert storage.read_text("_meta/broken.txt") is None
+
+
 def test_s3_chunk_storage_write_table_delegates_to_pyarrow() -> None:
     fake_fs = _FakeS3FS()
     with (
@@ -266,6 +275,16 @@ def test_s3_chunk_storage_write_and_read_json() -> None:
 
     fake_fs.objects["bucket/proto/contract/_meta/list.json"] = json.dumps([1, 2]).encode("utf-8")
     assert storage.read_json("_meta/list.json") is None
+
+
+def test_s3_chunk_storage_read_json_raises_on_fs_error() -> None:
+    fake_fs = _FakeS3FS()
+    fake_fs.raise_on_get = True
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    with pytest.raises(RuntimeError):
+        storage.read_json("_meta/coverage_index.json")
 
 
 def test_s3_chunk_storage_create_json_if_absent_uses_conditional_put() -> None:
@@ -390,6 +409,31 @@ def test_s3_chunk_storage_list_incomplete_multipart_uploads_filters_by_age_and_p
         Bucket="bucket",
         Prefix="proto/contract/CollectProtocol/",
     )
+
+
+def test_s3_chunk_storage_list_incomplete_multipart_uploads_rejects_marker_loop() -> None:
+    fake_fs = _FakeS3FS()
+    with patch("defind.storage.s3.pa_fs.S3FileSystem", return_value=fake_fs):
+        storage = S3ChunkStorage(bucket="bucket", prefix="proto/contract", max_retries=0, retry_backoff_s=0.0)
+
+    storage._s3_client = MagicMock()
+    storage._s3_client.list_multipart_uploads.side_effect = [
+        {
+            "Uploads": [],
+            "IsTruncated": True,
+            "NextKeyMarker": "same",
+            "NextUploadIdMarker": "same-upload",
+        },
+        {
+            "Uploads": [],
+            "IsTruncated": True,
+            "NextKeyMarker": "same",
+            "NextUploadIdMarker": "same-upload",
+        },
+    ]
+
+    with pytest.raises(RuntimeError, match="marker loop"):
+        storage.list_incomplete_multipart_uploads()
 
 
 def test_s3_chunk_storage_abort_incomplete_multipart_upload_is_idempotent_on_missing_upload() -> None:

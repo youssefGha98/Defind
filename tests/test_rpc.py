@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from defind.clients.rpc import RPC, topics_param
+from defind.clients.rpc import RPC, RPCError, is_hex_address, is_topic0, topics_param
+
+TOPIC0 = "0x" + "a" * 64
+TOPIC1 = "0x" + "b" * 64
+ADDR = "0xabcdef0000000000000000000000000000000000"
 
 
 def _http_response(status: int, payload: dict[str, Any]) -> httpx.Response:
@@ -106,7 +110,7 @@ async def test_get_logs_parses_fields_and_fallback_hash_keys() -> None:
             "result": [
                 {
                     "address": "0xABCDEF0000000000000000000000000000000001",
-                    "topics": ["0xAbC", b"0xDEF"],
+                    "topics": [f"0x{'A' * 64}", TOPIC1.encode()],
                     "data": "0x",
                     "blockNumber": "0x10",
                     "transactionHash": "0xTX1",
@@ -127,15 +131,15 @@ async def test_get_logs_parses_fields_and_fallback_hash_keys() -> None:
     )
 
     out = await rpc.get_logs(
-        address="0xABCDEF0000000000000000000000000000000000",
-        topic0s=["0xAbC"],
+        address=ADDR,
+        topic0s=[f"0x{'A' * 64}"],
         from_block=1,
         to_block=2,
     )
 
     assert len(out) == 2
     assert out[0].address == "0xabcdef0000000000000000000000000000000001"
-    assert out[0].topics == ("0xabc", "0xdef")
+    assert out[0].topics == (TOPIC0, TOPIC1)
     assert out[0].block_number == 16
     assert out[0].tx_hash == "0xtx1"
     assert out[0].block_timestamp == 100
@@ -149,13 +153,53 @@ async def test_get_logs_raises_on_rpc_error_payload() -> None:
     rpc = RPC("http://localhost:8545")
     cast(Any, rpc)._post_json = AsyncMock(return_value={"error": {"code": -32005, "message": "too many"}})
 
-    with pytest.raises(RuntimeError, match="RPC error: -32005 too many"):
+    with pytest.raises(RPCError, match="RPC error: -32005 too many") as excinfo:
         await rpc.get_logs(
-            address="0xabc",
-            topic0s=["0x1"],
+            address=ADDR,
+            topic0s=[TOPIC0],
             from_block=1,
             to_block=2,
         )
+
+    assert excinfo.value.url == "http://localhost:8545"
+    assert excinfo.value.rpc_method == "eth_getLogs"
+    assert excinfo.value.rpc_code == -32005
+    assert excinfo.value.rpc_message == "too many"
+    await rpc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_logs_rejects_invalid_address_and_topic0s() -> None:
+    rpc = RPC("http://localhost:8545")
+
+    with pytest.raises(ValueError, match="40-hex Ethereum address"):
+        await rpc.get_logs(address="0xabc", topic0s=[TOPIC0], from_block=1, to_block=2)
+
+    with pytest.raises(ValueError, match="64-hex topic signatures"):
+        await rpc.get_logs(address=ADDR, topic0s=["0xabc"], from_block=1, to_block=2)
+
+    await rpc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rpc_context_manager_closes_underlying_client() -> None:
+    rpc = RPC("http://localhost:8545")
+    aclose_mock = AsyncMock()
+    cast(Any, rpc.client).aclose = aclose_mock
+
+    async with rpc:
+        pass
+
+    aclose_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rpc_client_sets_default_headers() -> None:
+    rpc = RPC("http://localhost:8545")
+
+    assert rpc.client.headers["user-agent"] == "defind/0.2"
+    assert rpc.client.headers["accept"] == "application/json"
+    assert rpc.client.headers["content-type"] == "application/json"
 
     await rpc.aclose()
 
@@ -169,3 +213,10 @@ async def test_aclose_closes_underlying_client() -> None:
     await rpc.aclose()
 
     aclose_mock.assert_awaited_once()
+
+
+def test_address_and_topic0_validators() -> None:
+    assert is_hex_address(ADDR) is True
+    assert is_hex_address("0xabc") is False
+    assert is_topic0(TOPIC0) is True
+    assert is_topic0("0xabc") is False

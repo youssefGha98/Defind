@@ -17,8 +17,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
+from urllib.parse import urlsplit
 
-from defind.clients.rpc import RPC
+from defind.clients.rpc import RPC, is_hex_address, is_topic0
 from defind.core.config import OrchestratorConfig
 from defind.core.interfaces import IChunkStorage, IEvmLogsProvider
 from defind.core.use_cases.fetch_decode import (
@@ -73,7 +74,7 @@ class _ProgressState:
     last_indexed_block: int
     chain_head_block: int | None
     address: str
-    rpc_url: str
+    rpc_endpoint: str
 
 
 @dataclass(slots=True)
@@ -115,7 +116,7 @@ async def _heartbeat_loop(
             "chain_head_block": progress.chain_head_block,
             "lag_blocks": lag_blocks,
             "address": progress.address,
-            "rpc_url": progress.rpc_url,
+            "rpc_endpoint": progress.rpc_endpoint,
         }
 
         try:
@@ -210,11 +211,7 @@ def _try_create_lock_if_absent(
     if callable(create_if_absent) and hasattr(type(storage), "create_json_if_absent"):
         return bool(create_if_absent(key, payload))
 
-    # Legacy fallback for backends without atomic-create support.
-    if storage.exists(key):
-        return False
-    storage.write_json(key, payload)
-    return True
+    raise RuntimeError("writer lock backend does not support atomic lock creation")
 
 
 def _acquire_writer_lock(
@@ -487,6 +484,17 @@ def _validate_slug(value: str, *, label: str) -> None:
         raise ValueError(f"{label} must not contain path separators or '..'")
 
 
+def _redact_sensitive_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    if not cleaned:
+        return ""
+    parts = urlsplit(cleaned)
+    if not parts.scheme or not parts.hostname:
+        return ""
+    port = f":{parts.port}" if parts.port is not None else ""
+    return f"{parts.scheme}://{parts.hostname}{port}"
+
+
 def _validate_runtime_config(*, config: OrchestratorConfig, effective_chunk_size: int) -> None:
     if config.step <= 0:
         raise ValueError("step must be > 0")
@@ -520,8 +528,13 @@ def _validate_runtime_config(*, config: OrchestratorConfig, effective_chunk_size
         raise ValueError("log_level must not be empty")
     if not config.address or not config.address.strip():
         raise ValueError("address must not be empty")
+    if not is_hex_address(config.address):
+        raise ValueError("address must be a 0x-prefixed 40-hex Ethereum address")
     if not config.topic0s:
         raise ValueError("topic0s must not be empty")
+    invalid_topic0s = [topic for topic in config.topic0s if not is_topic0(topic)]
+    if invalid_topic0s:
+        raise ValueError("topic0s must contain only 0x-prefixed 64-hex topic signatures")
     _validate_slug(config.protocol_slug, label="protocol_slug")
     _validate_slug(config.contract_slug, label="contract_slug")
 
@@ -616,6 +629,58 @@ def _plan_startup_small_interval_compaction(
         if (ma, mb) in exact:
             continue
         if mb > we:
+            continue
+        out.append(WorkSeed(start=ma, end=mb))
+    return out
+
+
+def _plan_startup_storage_fragment_compaction(
+    *,
+    storage: IChunkStorage,
+    event_names: list[str],
+    anchor_start: int,
+    chunk_size: int,
+) -> list[WorkSeed]:
+    """Repair fragmented partial windows by scanning per-event chunk files directly."""
+    if chunk_size <= 0 or not event_names:
+        return []
+
+    by_window: dict[int, set[tuple[int, int]]] = {}
+    for ev in event_names:
+        try:
+            keys = storage.list_keys(f"{ev}/")
+        except Exception as exc:
+            logger.warning(
+                "startup_compaction_scan_failed",
+                extra={"event_name": ev, "error": str(exc)},
+            )
+            return []
+        for key in keys:
+            parsed = parse_chunk_key(key)
+            if parsed is None:
+                continue
+            a, b = parsed
+            if a < anchor_start:
+                continue
+            idx = (a - anchor_start) // chunk_size
+            ws = anchor_start + idx * chunk_size
+            we = ws + chunk_size - 1
+            if a < ws or b > we:
+                continue
+            by_window.setdefault(idx, set()).add((a, b))
+
+    out: list[WorkSeed] = []
+    for idx, parts in sorted(by_window.items()):
+        if len(parts) <= 1:
+            continue
+        merged = merge_intervals(sorted(parts))
+        if len(merged) != 1:
+            continue
+        ma, mb = merged[0]
+        span = mb - ma + 1
+        if span >= chunk_size:
+            continue
+        if (ma, mb) in parts:
             continue
         out.append(WorkSeed(start=ma, end=mb))
     return out
@@ -911,7 +976,7 @@ async def fetch_decode(
                     end if isinstance(config.end_block, str) and config.end_block.lower() == "latest" else None
                 ),
                 address=config.address,
-                rpc_url=config.rpc_url,
+                rpc_endpoint=_redact_sensitive_url(config.rpc_url),
             )
 
             if config.heartbeat_interval_s > 0:
@@ -975,11 +1040,30 @@ async def fetch_decode(
 
             # Startup compaction: if a merged covered range is < chunk_size but split
             # across multiple files, rewrite it as one interval before normal planning.
-            startup_compaction_seeds = _plan_startup_small_interval_compaction(
-                anchor_start=start,
-                chunk_size=effective_chunk_size,
-                done_chunks=done_chunks_state,
+            startup_compaction_candidates = {
+                (seed.start, seed.end)
+                for seed in _plan_startup_small_interval_compaction(
+                    anchor_start=start,
+                    chunk_size=effective_chunk_size,
+                    done_chunks=done_chunks_state,
+                )
+            }
+            startup_compaction_candidates.update(
+                (
+                    seed.start,
+                    seed.end,
+                )
+                for seed in _plan_startup_storage_fragment_compaction(
+                    storage=storage,
+                    event_names=event_names,
+                    anchor_start=start,
+                    chunk_size=effective_chunk_size,
+                )
             )
+            startup_compaction_seeds = [
+                WorkSeed(start=seed_start, end=seed_end)
+                for seed_start, seed_end in sorted(startup_compaction_candidates)
+            ]
             if startup_compaction_seeds:
                 logger.info(
                     "startup_compaction_planned",

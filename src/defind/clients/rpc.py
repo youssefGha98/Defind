@@ -10,6 +10,8 @@ It returns `EventLog` records ready for downstream decoding.
 from __future__ import annotations
 
 import asyncio
+import random
+import re
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -19,6 +21,8 @@ from defind.core.interfaces import IEvmLogsProvider
 from defind.core.models import EventLog
 
 JsonDict = dict[str, Any]
+_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_TOPIC0_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
 
 def to_hex_block(x: int) -> str:
@@ -29,6 +33,35 @@ def to_hex_block(x: int) -> str:
 def topics_param(topic0s: Sequence[str]) -> list[list[str]]:
     """Format topic0 signatures for eth_getLogs RPC call."""
     return [[t.lower() for t in topic0s]]
+
+
+def is_hex_address(value: str) -> bool:
+    return bool(_ADDRESS_RE.match((value or "").strip()))
+
+
+def is_topic0(value: str) -> bool:
+    return bool(_TOPIC0_RE.match((value or "").strip()))
+
+
+class RPCError(RuntimeError):
+    """Structured RPC failure with enough context for logs and debugging."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str,
+        rpc_method: str,
+        rpc_code: int | None = None,
+        rpc_message: str | None = None,
+        rpc_data: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.url = url
+        self.rpc_method = rpc_method
+        self.rpc_code = rpc_code
+        self.rpc_message = rpc_message
+        self.rpc_data = rpc_data
 
 
 class RPC(IEvmLogsProvider):
@@ -68,7 +101,18 @@ class RPC(IEvmLogsProvider):
                 max_keepalive_connections=max(1, max_connections // 2),
             ),
             http2=True,
+            headers={
+                "User-Agent": "defind/0.2",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
         )
+
+    async def __aenter__(self) -> RPC:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
 
     async def _post_json(self, payload: JsonDict) -> JsonDict:
         delay = self.retry_backoff_s
@@ -88,7 +132,8 @@ class RPC(IEvmLogsProvider):
                     raise
 
             if delay > 0:
-                await asyncio.sleep(delay)
+                sleep_for = random.uniform(delay, min(delay * 1.25, 8.0))
+                await asyncio.sleep(sleep_for)
                 delay = min(delay * 2, 8.0)
             attempt += 1
 
@@ -98,7 +143,14 @@ class RPC(IEvmLogsProvider):
         data = await self._post_json(payload)
         if "error" in data:
             e = data["error"]
-            raise RuntimeError(f"RPC error: {e.get('code')} {e.get('message')}")
+            raise RPCError(
+                f"RPC error: {e.get('code')} {e.get('message')}",
+                url=self.url,
+                rpc_method="eth_blockNumber",
+                rpc_code=e.get("code"),
+                rpc_message=e.get("message"),
+                rpc_data=e.get("data"),
+            )
         return int(data["result"], 16)
 
     async def get_logs(
@@ -110,9 +162,15 @@ class RPC(IEvmLogsProvider):
         to_block: int,
     ) -> list[EventLog]:
         """Fetch logs for an address and a set of topic0 signatures within a block range."""
+        normalized_address = address.strip()
+        if not is_hex_address(normalized_address):
+            raise ValueError("address must be a 0x-prefixed 40-hex Ethereum address")
+        invalid_topic0s = [topic for topic in topic0s if not is_topic0(topic)]
+        if invalid_topic0s:
+            raise ValueError("topic0s must contain only 0x-prefixed 64-hex topic signatures")
         params = [
             {
-                "address": address.lower(),
+                "address": normalized_address.lower(),
                 "fromBlock": to_hex_block(from_block),
                 "toBlock": to_hex_block(to_block),
                 "topics": topics_param(topic0s),
@@ -123,7 +181,14 @@ class RPC(IEvmLogsProvider):
         )
         if "error" in data:
             e = data["error"]
-            raise RuntimeError(f"RPC error: {e.get('code')} {e.get('message')}")
+            raise RPCError(
+                f"RPC error: {e.get('code')} {e.get('message')}",
+                url=self.url,
+                rpc_method="eth_getLogs",
+                rpc_code=e.get("code"),
+                rpc_message=e.get("message"),
+                rpc_data=e.get("data"),
+            )
 
         out: list[EventLog] = []
         for rl in data.get("result", []):

@@ -22,9 +22,9 @@ class OrchestratorConfig:
     chunk_size: int | None = None  # taille du fichier de sortie (blocs par Parquet)
     # None → même valeur que step (1 fichier par step)
     concurrency: int = 16
-    timeout_s: int = 20
-    rpc_max_retries: int = 3
-    rpc_retry_backoff_s: float = 0.5
+    timeout_s: int = 90
+    rpc_max_retries: int = 5
+    rpc_retry_backoff_s: float = 1
     codec: str = "lz4"  # compression Parquet ("lz4", "zstd", "snappy", "none")
     listen: bool = False  # continue polling after backfill
     listen_poll_interval_s: float = 2.0

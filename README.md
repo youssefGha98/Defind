@@ -167,6 +167,11 @@ Main env vars:
 - `DEFIND_API_OUT_ROOT` (default `./data`)
 - `DEFIND_API_PORT` (default `8000`)
 - `DEFIND_API_CORS_ORIGINS` (default `*`)
+- `DEFIND_API_LOG_LEVEL` (default `INFO`)
+- `DEFIND_API_LOG_JSON` (default `true`)
+- `DEFIND_API_JSON_LOG_FILE` (optional local JSONL file for Loki/Alloy ingestion)
+- `DEFIND_API_LOGS_BACKEND` (`event_store` or `loki`, default `event_store`)
+- `DEFIND_API_LOKI_URL` (optional, for Loki-backed log reads)
 - `DEFIND_API_ETHERSCAN_API_URL` (default `https://api.etherscan.io/v2/api`)
 - `DEFIND_API_ETHERSCAN_CHAIN_ID` (default `1`)
 - `DEFIND_API_EVENT_HISTORY_PREFIX` (default `_meta/event_history/`)
@@ -200,6 +205,10 @@ Minimal job start payload:
 }
 ```
 
+Local Grafana/Loki setup:
+
+- see [ops/observability/README.md](ops/observability/README.md)
+
 ## Systemd setup (VPS)
 
 Files are in `ops/systemd/`.
@@ -207,9 +216,8 @@ Files are in `ops/systemd/`.
 Indexer service:
 
 ```bash
-cp /home/youssef/defind/Defind/ops/systemd/defind-indexer.env.example \
-   /home/youssef/defind/Defind/ops/systemd/defind-indexer.env
-sudo cp /home/youssef/defind/Defind/ops/systemd/defind-indexer.service /etc/systemd/system/
+cp ops/systemd/defind-indexer.env.example ops/systemd/defind-indexer.env
+sudo cp ops/systemd/defind-indexer.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now defind-indexer.service
 ```
@@ -217,10 +225,9 @@ sudo systemctl enable --now defind-indexer.service
 Watchdog timer:
 
 ```bash
-cp /home/youssef/defind/Defind/ops/systemd/defind-watchdog.env.example \
-   /home/youssef/defind/Defind/ops/systemd/defind-watchdog.env
-sudo cp /home/youssef/defind/Defind/ops/systemd/defind-watchdog.service /etc/systemd/system/
-sudo cp /home/youssef/defind/Defind/ops/systemd/defind-watchdog.timer /etc/systemd/system/
+cp ops/systemd/defind-watchdog.env.example ops/systemd/defind-watchdog.env
+sudo cp ops/systemd/defind-watchdog.service /etc/systemd/system/
+sudo cp ops/systemd/defind-watchdog.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now defind-watchdog.timer
 ```

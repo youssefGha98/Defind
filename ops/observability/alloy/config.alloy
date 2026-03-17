@@ -1,0 +1,55 @@
+local.file_match "defind_api_logs" {
+  path_targets = [
+    {
+      __path__ = "/var/log/defind/*.jsonl",
+      job      = "defind-api",
+    },
+  ]
+}
+
+loki.source.file "defind_api_logs" {
+  targets       = local.file_match.defind_api_logs.targets
+  tail_from_end = true
+  forward_to    = [loki.process.defind_api.receiver]
+}
+
+loki.process "defind_api" {
+  stage.json {
+    expressions = {
+      level      = "level",
+      logger     = "logger",
+      event      = "event",
+      dataset_id = "dataset_id",
+      job_id     = "job_id",
+      run_id     = "run_id",
+      protocol   = "protocol",
+      contract   = "contract",
+      trace_id   = "trace_id",
+      span_id    = "span_id",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level      = "",
+      dataset_id = "",
+      job_id     = "",
+      run_id     = "",
+      protocol   = "",
+      contract   = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+
+  external_labels = {
+    service     = "defind-api",
+    environment = "local",
+  }
+}

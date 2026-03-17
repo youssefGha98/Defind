@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 logger = get_logger(__name__)
 T = TypeVar("T")
+_MAX_MULTIPART_PAGES = 1_000
 _RETRYABLE_MARKERS = (
     "timeout",
     "timed out",
@@ -179,7 +181,8 @@ class S3ChunkStorage(IChunkStorage):
                     },
                 )
                 if delay > 0:
-                    time.sleep(delay)
+                    sleep_for = random.uniform(delay, min(delay * 1.25, 8.0))
+                    time.sleep(sleep_for)
                     delay = min(delay * 2, 8.0)
                 attempt += 1
 
@@ -424,8 +427,20 @@ class S3ChunkStorage(IChunkStorage):
 
         uploads: list[dict[str, Any]] = []
         list_kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": s3_prefix}
+        seen_markers: set[tuple[str, str]] = set()
+        page_count = 0
 
         while True:
+            page_count += 1
+            if page_count > _MAX_MULTIPART_PAGES:
+                raise RuntimeError(f"multipart upload pagination exceeded max pages ({_MAX_MULTIPART_PAGES})")
+            marker = (
+                str(list_kwargs.get("KeyMarker") or ""),
+                str(list_kwargs.get("UploadIdMarker") or ""),
+            )
+            if marker in seen_markers:
+                raise RuntimeError("multipart upload pagination entered a marker loop")
+            seen_markers.add(marker)
             request_kwargs = list_kwargs.copy()
 
             def _list_page(kwargs: dict[str, Any] = request_kwargs) -> dict[str, Any]:
@@ -470,6 +485,8 @@ class S3ChunkStorage(IChunkStorage):
             list_kwargs["KeyMarker"] = next_key_marker
             if next_upload_marker:
                 list_kwargs["UploadIdMarker"] = next_upload_marker
+            else:
+                list_kwargs.pop("UploadIdMarker", None)
 
         return uploads
 
@@ -556,16 +573,25 @@ class S3ChunkStorage(IChunkStorage):
         s3_path = self._s3_path(key)
         try:
             info = self._with_retries("read_json_info", lambda: self._fs.get_file_info(s3_path))
-            if info.type != pa_fs.FileType.File:
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
                 return None
+            logger.warning(
+                "s3_read_json_info_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
+            raise
+        if info.type != pa_fs.FileType.File:
+            return None
 
-            def _read_raw() -> bytes:
-                with self._fs.open_input_file(s3_path) as inp:
-                    return cast(bytes, inp.read())
+        def _read_raw() -> bytes:
+            with self._fs.open_input_file(s3_path) as inp:
+                return cast(bytes, inp.read())
 
+        try:
             raw = self._with_retries("read_json", _read_raw)
-            data = json.loads(raw.decode("utf-8"))
-            return cast(dict[str, Any], data) if isinstance(data, dict) else None
         except Exception as exc:
             if self._is_not_found_exception(exc):
                 return None
@@ -575,21 +601,41 @@ class S3ChunkStorage(IChunkStorage):
                 exc,
                 extra={"path": f"s3://{s3_path}", "error": str(exc)},
             )
+            raise
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning(
+                "s3_read_json_invalid path=s3://%s",
+                s3_path,
+                extra={"path": f"s3://{s3_path}"},
+            )
             return None
+        return cast(dict[str, Any], data) if isinstance(data, dict) else None
 
     def read_text(self, key: str) -> str | None:
         s3_path = self._s3_path(key)
         try:
             info = self._with_retries("read_text_info", lambda: self._fs.get_file_info(s3_path))
-            if info.type != pa_fs.FileType.File:
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
                 return None
+            logger.warning(
+                "s3_read_text_info_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
+            raise
+        if info.type != pa_fs.FileType.File:
+            return None
 
-            def _read_raw() -> bytes:
-                with self._fs.open_input_file(s3_path) as inp:
-                    return cast(bytes, inp.read())
+        def _read_raw() -> bytes:
+            with self._fs.open_input_file(s3_path) as inp:
+                return cast(bytes, inp.read())
 
+        try:
             raw = self._with_retries("read_text", _read_raw)
-            return raw.decode("utf-8")
         except Exception as exc:
             if self._is_not_found_exception(exc):
                 return None
@@ -599,4 +645,32 @@ class S3ChunkStorage(IChunkStorage):
                 exc,
                 extra={"path": f"s3://{s3_path}", "error": str(exc)},
             )
+            raise
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning(
+                "s3_read_text_invalid_encoding path=s3://%s",
+                s3_path,
+                extra={"path": f"s3://{s3_path}"},
+            )
             return None
+
+    def is_valid_parquet(self, key: str) -> bool:
+        s3_path = self._s3_path(key)
+        try:
+            info = self._with_retries("parquet_info", lambda: self._fs.get_file_info(s3_path))
+            if info.type != pa_fs.FileType.File:
+                return False
+            pq.read_metadata(s3_path, filesystem=self._fs)
+            return True
+        except Exception as exc:
+            if self._is_not_found_exception(exc):
+                return False
+            logger.warning(
+                "s3_parquet_validation_failed path=s3://%s err=%s",
+                s3_path,
+                exc,
+                extra={"path": f"s3://{s3_path}", "error": str(exc)},
+            )
+            return False

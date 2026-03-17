@@ -21,6 +21,7 @@ class CoverageValidationReport:
     missing_in_range: list[tuple[int, int]]
     overlaps_by_event: dict[str, list[tuple[int, int]]]
     event_mismatch_by_event: dict[str, list[tuple[int, int]]]
+    invalid_chunks_by_event: dict[str, list[str]]
 
     @property
     def is_valid(self) -> bool:
@@ -32,16 +33,29 @@ class CoverageValidationReport:
             return False
         if any(self.event_mismatch_by_event.values()):
             return False
+        if any(self.invalid_chunks_by_event.values()):
+            return False
         return True
 
 
-def _load_event_intervals(storage: IChunkStorage, event_name: str) -> list[tuple[int, int]]:
+def _chunk_file_is_valid(storage: IChunkStorage, key: str) -> bool:
+    validate_chunk = getattr(storage, "is_valid_parquet", None)
+    if callable(validate_chunk):
+        return bool(validate_chunk(key))
+    return True
+
+
+def _load_event_intervals(storage: IChunkStorage, event_name: str) -> tuple[list[tuple[int, int]], list[str]]:
     intervals: set[tuple[int, int]] = set()
+    invalid: list[str] = []
     for key in storage.list_keys(f"{event_name}/"):
         parsed = parse_chunk_key(key)
         if parsed is not None:
+            if not _chunk_file_is_valid(storage, key):
+                invalid.append(key)
+                continue
             intervals.add(parsed)
-    return sorted(intervals)
+    return sorted(intervals), sorted(invalid)
 
 
 def _find_overlaps(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -76,7 +90,9 @@ def validate_coverage(
     if start_block is not None and end_block is not None and start_block > end_block:
         raise ValueError("start_block must be <= end_block")
 
-    per_event = {event: _load_event_intervals(storage, event) for event in event_names}
+    loaded = {event: _load_event_intervals(storage, event) for event in event_names}
+    per_event = {event: intervals for event, (intervals, _) in loaded.items()}
+    invalid_chunks_by_event = {event: invalid for event, (_, invalid) in loaded.items()}
     overlaps_by_event = {event: _find_overlaps(intervals) for event, intervals in per_event.items()}
 
     union_chunks: set[tuple[int, int]] = set()
@@ -101,4 +117,5 @@ def validate_coverage(
         missing_in_range=missing_in_range,
         overlaps_by_event=overlaps_by_event,
         event_mismatch_by_event=event_mismatch_by_event,
+        invalid_chunks_by_event=invalid_chunks_by_event,
     )

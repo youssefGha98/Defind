@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from defind.clients.rpc import RPCError, is_hex_address, is_topic0
 from defind.core.interfaces import IChunkStorage, IEventRegistryProvider, IEvmLogsProvider
 from defind.core.models import EventLog, Meta
 from defind.decoding.decoder import decode_event
@@ -108,6 +112,13 @@ class RPCFetchError(RuntimeError):
         self.retryable = retryable
 
 
+class _SubrangeFetchError(RuntimeError):
+    def __init__(self, from_block: int, to_block: int) -> None:
+        super().__init__(f"subrange fetch failed for [{from_block}, {to_block}]")
+        self.from_block = from_block
+        self.to_block = to_block
+
+
 _RANGE_ERROR_MARKERS = (
     "more than",
     "too many",
@@ -119,16 +130,29 @@ _RANGE_ERROR_MARKERS = (
 )
 
 
+def _looks_timeout_message(message: str) -> bool:
+    msg = (message or "").lower()
+    return "timed out" in msg or "timeout" in msg
+
+
 def _looks_range_limited_message(message: str) -> bool:
     msg = (message or "").lower()
     return any(marker in msg for marker in _RANGE_ERROR_MARKERS)
 
 
 def _is_splitable_rpc_exception(exc: Exception) -> bool:
+    if isinstance(exc, RPCError):
+        if exc.rpc_code == -32002:
+            return True
+        msg = " ".join(str(part or "") for part in (exc.rpc_message, exc))
+        if exc.rpc_code == -32005:
+            return True
+        return _looks_range_limited_message(msg) or _looks_timeout_message(msg)
+
     # JSON-RPC structured errors from the RPC client.
     if isinstance(exc, RuntimeError) and str(exc).startswith("RPC error:"):
         msg = str(exc).lower()
-        return ("-32005" in msg) or _looks_range_limited_message(msg)
+        return ("-32005" in msg) or _looks_range_limited_message(msg) or _looks_timeout_message(msg)
 
     # Some providers return HTTP errors instead of JSON-RPC errors.
     if isinstance(exc, httpx.HTTPStatusError):
@@ -148,11 +172,140 @@ def _is_splitable_rpc_exception(exc: Exception) -> bool:
 
 
 def _is_retryable_rpc_exception(exc: Exception) -> bool:
+    if isinstance(exc, RPCError):
+        if exc.rpc_code == -32002:
+            return True
+        msg = " ".join(str(part or "") for part in (exc.rpc_message, exc))
+        return _looks_timeout_message(msg)
     return isinstance(exc, (httpx.TransportError, httpx.TimeoutException, asyncio.TimeoutError))
 
 
 _CHUNK_NETWORK_RETRY_ATTEMPTS = 2
 _CHUNK_NETWORK_RETRY_BACKOFF_S = 1.0
+
+
+def _jittered_backoff_s(delay_s: float) -> float:
+    if delay_s <= 0:
+        return 0.0
+    return random.uniform(delay_s, min(delay_s * 1.25, 8.0))
+
+
+def _redact_request_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    if not cleaned:
+        return ""
+    parts = urlsplit(cleaned)
+    if not parts.scheme or not parts.hostname:
+        return ""
+    port = f":{parts.port}" if parts.port is not None else ""
+    return f"{parts.scheme}://{parts.hostname}{port}"
+
+
+def _compact_error_text(value: str, *, limit: int = 240) -> str:
+    cleaned = " ".join((value or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 3]}..."
+
+
+def _rpc_error_log_context(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "rpc_error_type": type(exc).__name__,
+    }
+    detail = _compact_error_text(str(exc).strip())
+    if detail:
+        payload["rpc_error"] = detail
+
+    if isinstance(exc, RPCError):
+        redacted_url = _redact_request_url(exc.url)
+        if redacted_url:
+            payload["rpc_url"] = redacted_url
+        if exc.rpc_method:
+            payload["rpc_method"] = exc.rpc_method
+        if exc.rpc_code is not None:
+            payload["rpc_code"] = exc.rpc_code
+        if exc.rpc_message:
+            payload["rpc_message"] = str(exc.rpc_message)
+        if exc.rpc_data is not None:
+            payload["rpc_data"] = exc.rpc_data
+        return payload
+
+    request = getattr(exc, "request", None)
+    if request is None and isinstance(exc, httpx.HTTPStatusError):
+        request = exc.response.request
+    if request is not None:
+        redacted_url = _redact_request_url(str(request.url))
+        if redacted_url:
+            payload["rpc_url"] = redacted_url
+        method = str(getattr(request, "method", "") or "").upper()
+        if method:
+            payload["rpc_method"] = method
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        payload["rpc_http_status"] = int(exc.response.status_code)
+        try:
+            response_body = _compact_error_text(exc.response.text)
+        except Exception:
+            response_body = ""
+        if response_body:
+            payload["rpc_response_body"] = response_body
+
+    return payload
+
+
+def _decoded_row_count(buffers: dict[str, dict[str, list[Any]]]) -> int:
+    total = 0
+    for ev_buf in buffers.values():
+        total += len(ev_buf.get("block_number", []))
+    return total
+
+
+def _chunk_manifest_payload(
+    *,
+    from_block: int,
+    to_block: int,
+    status: str,
+    attempts: int,
+    error: str | None,
+    logs: int,
+    decoded: int,
+    filtered: int,
+    shards: int,
+    files_written: int | None = None,
+    step: int | None = None,
+    subrange_count: int | None = None,
+    duration_s: float | None = None,
+    retryable: bool | None = None,
+    splitable: bool | None = None,
+    rpc_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "from_block": from_block,
+        "to_block": to_block,
+        "status": status,
+        "attempts": attempts,
+        "error": error,
+        "logs": logs,
+        "decoded": decoded,
+        "filtered": filtered,
+        "shards": shards,
+        "updated_at": time.time(),
+    }
+    if files_written is not None:
+        payload["files_written"] = files_written
+    if step is not None:
+        payload["step"] = step
+    if subrange_count is not None:
+        payload["subrange_count"] = subrange_count
+    if duration_s is not None:
+        payload["duration_s"] = duration_s
+    if retryable is not None:
+        payload["retryable"] = retryable
+    if splitable is not None:
+        payload["splitable"] = splitable
+    if rpc_context:
+        payload.update(rpc_context)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +346,16 @@ def _decode_logs(
     Filtered logs are silently skipped.
     """
     buffers: dict[str, dict[str, list[Any]]] = {}
+    _decode_logs_into(logs, registry, buffers)
+    return buffers
+
+
+def _decode_logs_into(
+    logs: list[EventLog],
+    registry: EventRegistry,
+    buffers: dict[str, dict[str, list[Any]]],
+) -> None:
+    """Decode logs into existing per-event columnar buffers."""
 
     for ev in logs:
         if not ev.topics:
@@ -239,16 +402,18 @@ def _decode_logs(
         for out_key, v in pe.values.items():
             ev_buf[out_key].append(None if v is None else str(v))
 
-    return buffers
-
 
 # ---------------------------------------------------------------------------
 # Internal: fetch all logs for a chunk_size range via step-sized sub-fetches
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLog]:
-    """Fetch all logs for [a, b] using concurrent step-sized sub-range calls."""
+async def _fetch_chunk_buffers(
+    ctx: ProcessContext,
+    a: int,
+    b: int,
+) -> tuple[dict[str, dict[str, list[Any]]], int, int, float]:
+    """Fetch all logs for [a, b], decoding batches as they arrive."""
 
     sub_ranges = list(iter_chunks(a, b, ctx.step))
     started_at = asyncio.get_running_loop().time()
@@ -263,38 +428,139 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
         },
     )
 
-    async def _fetch_sub(from_b: int, to_b: int) -> list[EventLog]:
-        async with ctx.sem:
-            return await ctx.rpc.get_logs(
-                address=ctx.address,
-                topic0s=ctx.topic0s,
-                from_block=from_b,
-                to_block=to_b,
-            )
+    buffers: dict[str, dict[str, list[Any]]] = {}
+    total_log_count = 0
+    executed_subranges = 0
 
+    async def _fetch_subrange(from_b: int, to_b: int, *, attempt: int = 0) -> tuple[int, int]:
+        try:
+            async with ctx.sem:
+                logs = await ctx.rpc.get_logs(
+                    address=ctx.address,
+                    topic0s=ctx.topic0s,
+                    from_block=from_b,
+                    to_block=to_b,
+                )
+        except Exception as exc:
+            cause = exc
+            splitable = _is_splitable_rpc_exception(cause)
+            retryable = _is_retryable_rpc_exception(cause)
+            rpc_context = _rpc_error_log_context(cause)
+
+            if retryable and attempt < _CHUNK_NETWORK_RETRY_ATTEMPTS:
+                delay_s = _jittered_backoff_s(_CHUNK_NETWORK_RETRY_BACKOFF_S * (2**attempt))
+                logger.warning(
+                    "chunk_fetch_retry",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "subrange_start": from_b,
+                        "subrange_end": to_b,
+                        "attempt": attempt + 1,
+                        "max_attempts": _CHUNK_NETWORK_RETRY_ATTEMPTS + 1,
+                        "retry_in_s": delay_s,
+                        **rpc_context,
+                    },
+                )
+                logger.warning(
+                    "chunk_manifest",
+                    extra=_chunk_manifest_payload(
+                        from_block=a,
+                        to_block=b,
+                        status="retrying",
+                        attempts=attempt + 1,
+                        error=str(cause).strip() or type(cause).__name__,
+                        logs=0,
+                        decoded=0,
+                        filtered=0,
+                        shards=0,
+                        step=ctx.step,
+                        subrange_count=len(sub_ranges),
+                        retryable=True,
+                        splitable=splitable,
+                        rpc_context={
+                            **rpc_context,
+                            "subrange_start": from_b,
+                            "subrange_end": to_b,
+                        },
+                    ),
+                )
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+                return await _fetch_subrange(from_b, to_b, attempt=attempt + 1)
+
+            if splitable and from_b < to_b:
+                mid = (from_b + to_b) // 2
+                ctx.stats.partially_covered_split += 1
+                logger.warning(
+                    "chunk_subrange_split_retry",
+                    extra={
+                        "chunk_start": a,
+                        "chunk_end": b,
+                        "subrange_start": from_b,
+                        "subrange_end": to_b,
+                        "left_start": from_b,
+                        "left_end": mid,
+                        "right_start": mid + 1,
+                        "right_end": to_b,
+                        **rpc_context,
+                    },
+                )
+                left_result, right_result = await asyncio.gather(
+                    _fetch_subrange(from_b, mid),
+                    _fetch_subrange(mid + 1, to_b),
+                )
+                return (
+                    left_result[0] + right_result[0],
+                    left_result[1] + right_result[1],
+                )
+
+            detail = f"RPC fetch failed for interval [{a}, {b}] subrange [{from_b}, {to_b}]"
+            raise RPCFetchError(
+                detail,
+                splitable=splitable,
+                retryable=retryable,
+            ) from cause
+
+        _decode_logs_into(logs, ctx.registry, buffers)
+        return len(logs), 1
+
+    tasks = [asyncio.create_task(_fetch_subrange(f, t)) for f, t in sub_ranges]
     try:
-        results = await asyncio.gather(*[_fetch_sub(f, t) for f, t in sub_ranges])
-    except Exception as e:
-        splitable = _is_splitable_rpc_exception(e)
-        retryable = _is_retryable_rpc_exception(e)
+        for task in asyncio.as_completed(tasks):
+            log_count, successful_subranges = await task
+            total_log_count += log_count
+            executed_subranges += successful_subranges
+    except Exception as exc:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if isinstance(exc, RPCFetchError):
+            raise
+        cause = exc.__cause__ if isinstance(exc, _SubrangeFetchError) and exc.__cause__ is not None else exc
+        splitable = _is_splitable_rpc_exception(cause)
+        retryable = _is_retryable_rpc_exception(cause)
+        detail = f"RPC fetch failed for interval [{a}, {b}]"
+        if isinstance(exc, _SubrangeFetchError):
+            detail += f" subrange [{exc.from_block}, {exc.to_block}]"
         raise RPCFetchError(
-            f"RPC fetch failed for interval [{a}, {b}]",
+            detail,
             splitable=splitable,
             retryable=retryable,
-        ) from e
-    ctx.stats.executed_subranges += len(sub_ranges)
-    out = [log for batch in results for log in batch]
+        ) from cause
+    ctx.stats.executed_subranges += executed_subranges
+    duration_s = round(asyncio.get_running_loop().time() - started_at, 3)
     logger.info(
         "chunk_fetch_complete",
         extra={
             "chunk_start": a,
             "chunk_end": b,
-            "subrange_count": len(sub_ranges),
-            "log_count": len(out),
-            "duration_s": round(asyncio.get_running_loop().time() - started_at, 3),
+            "subrange_count": executed_subranges,
+            "log_count": total_log_count,
+            "duration_s": duration_s,
         },
     )
-    return out
+    return buffers, total_log_count, executed_subranges, duration_s
 
 
 # ---------------------------------------------------------------------------
@@ -303,11 +569,11 @@ async def _fetch_chunk_logs(ctx: ProcessContext, a: int, b: int) -> list[EventLo
 
 
 async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
-    """Process one inclusive [seed.start, seed.end] range with retry splitting.
+    """Process one inclusive [seed.start, seed.end] range.
 
     Each seed produces exactly one Parquet per event type.
     Internally, the range is fetched using step-sized concurrent sub-calls.
-    On RPC fetch failures, the range splits in half and both halves retry.
+    On RPC fetch failures, retry/split happens at the RPC subrange level only.
     Decode/write failures are raised immediately.
     """
     if seed.start < 0 or seed.end < 0:
@@ -317,132 +583,135 @@ async def process_interval(ctx: ProcessContext, seed: WorkSeed) -> None:
     if ctx.stop_event is not None and ctx.stop_event.is_set():
         raise RuntimeError("writer lock lost during run")
 
-    stack: list[WorkSeed] = [seed]
-    retry_counts: dict[tuple[int, int], int] = {}
+    a, b = seed.start, seed.end
+    planned_subrange_count = len(list(iter_chunks(a, b, ctx.step)))
 
-    while stack:
-        if ctx.stop_event is not None and ctx.stop_event.is_set():
-            raise RuntimeError("writer lock lost during run")
-        current = stack.pop()
-        a, b = current.start, current.end
+    if (not ctx.force_reprocess) and chunk_is_done(ctx.storage, ctx.event_names, a, b):
+        return
 
-        # Skip if already written (handles both resume and retry-after-split)
-        if (not ctx.force_reprocess) and chunk_is_done(ctx.storage, ctx.event_names, a, b):
-            continue
-
-        try:
-            logger.info(
-                "chunk_process_start",
-                extra={
-                    "chunk_start": a,
-                    "chunk_end": b,
-                    "force_reprocess": ctx.force_reprocess,
-                },
-            )
-            logs = await _fetch_chunk_logs(ctx, a, b)
-        except RPCFetchError as e:
-            retry_key = (a, b)
-            retry_attempt = retry_counts.get(retry_key, 0)
-            if e.retryable and retry_attempt < _CHUNK_NETWORK_RETRY_ATTEMPTS:
-                retry_counts[retry_key] = retry_attempt + 1
-                delay_s = _CHUNK_NETWORK_RETRY_BACKOFF_S * (2**retry_attempt)
-                logger.warning(
-                    "chunk_fetch_retry",
-                    extra={
-                        "chunk_start": a,
-                        "chunk_end": b,
-                        "attempt": retry_attempt + 1,
-                        "max_attempts": _CHUNK_NETWORK_RETRY_ATTEMPTS + 1,
-                        "retry_in_s": delay_s,
-                    },
-                )
-                if delay_s > 0:
-                    await asyncio.sleep(delay_s)
-                stack.append(current)
-                continue
-            if not e.splitable:
-                ctx.stats.processed_failed += 1
-                logger.error(
-                    "chunk_fetch_failed",
-                    extra={
-                        "chunk_start": a,
-                        "chunk_end": b,
-                        "splitable": False,
-                        "retryable": e.retryable,
-                    },
-                    exc_info=True,
-                )
-                raise
-            children = current.split()
-            if children is None:
-                ctx.stats.processed_failed += 1
-                logger.error(
-                    "chunk_fetch_failed",
-                    extra={
-                        "chunk_start": a,
-                        "chunk_end": b,
-                        "splitable": True,
-                        "reason": "single_block_unrecoverable",
-                    },
-                    exc_info=True,
-                )
-                raise
-            left, right = children
-            stack.extend([left, right])
-            ctx.stats.partially_covered_split += 1
-            ctx.stats.processed_failed += 1
-            logger.warning(
-                "chunk_split_retry",
-                extra={
-                    "chunk_start": a,
-                    "chunk_end": b,
-                    "left_start": left.start,
-                    "left_end": left.end,
-                    "right_start": right.start,
-                    "right_end": right.end,
-                },
-            )
-            continue
-
-        buffers = _decode_logs(logs, ctx.registry)
-        if ctx.stop_event is not None and ctx.stop_event.is_set():
-            raise RuntimeError("writer lock lost during run")
-        written = write_chunk(ctx.storage, ctx.registry, a, b, buffers, ctx.codec)
-
-        if ctx.print_chunk_writes:
-            logger.info(
-                "chunk_written",
-                extra={
-                    "chunk_start": a,
-                    "chunk_end": b,
-                    "logs": len(logs),
-                    "files": len(written),
-                },
-            )
-            for key in written:
-                logger.info(
-                    "chunk_file_written",
-                    extra={
-                        "chunk_start": a,
-                        "chunk_end": b,
-                        "chunk_key": key,
-                    },
-                )
-
-        ctx.stats.total_logs += len(logs)
-        ctx.stats.processed_ok += 1
-        ctx.stats.chunks_written += len(written)
-        if ctx.on_chunk_written is not None:
-            await ctx.on_chunk_written(a, b)
+    try:
         logger.info(
-            "chunk_process_complete",
+            "chunk_process_start",
             extra={
                 "chunk_start": a,
                 "chunk_end": b,
-                "log_count": len(logs),
-                "files_written": len(written),
+                "force_reprocess": ctx.force_reprocess,
             },
         )
+        logger.info(
+            "chunk_manifest",
+            extra=_chunk_manifest_payload(
+                from_block=a,
+                to_block=b,
+                status="started",
+                attempts=0,
+                error=None,
+                logs=0,
+                decoded=0,
+                filtered=0,
+                shards=0,
+                step=ctx.step,
+                subrange_count=planned_subrange_count,
+            ),
+        )
+        buffers, log_count, subrange_count, fetch_duration_s = await _fetch_chunk_buffers(ctx, a, b)
+    except RPCFetchError as e:
+        ctx.stats.processed_failed += 1
+        cause = e.__cause__ if isinstance(e.__cause__, Exception) else e
+        rpc_context = _rpc_error_log_context(cause)
+        manifest_error = str(cause).strip() or str(e).strip()
+        logger.error(
+            "chunk_fetch_failed",
+            extra={
+                "chunk_start": a,
+                "chunk_end": b,
+                "splitable": e.splitable,
+                "retryable": e.retryable,
+                **rpc_context,
+            },
+            exc_info=True,
+        )
+        logger.error(
+            "chunk_manifest",
+            extra=_chunk_manifest_payload(
+                from_block=a,
+                to_block=b,
+                status="failed",
+                attempts=_CHUNK_NETWORK_RETRY_ATTEMPTS + 1 if e.retryable else 1,
+                error=manifest_error,
+                logs=0,
+                decoded=0,
+                filtered=0,
+                shards=0,
+                step=ctx.step,
+                subrange_count=planned_subrange_count,
+                retryable=e.retryable,
+                splitable=e.splitable,
+                rpc_context=rpc_context,
+            ),
+            exc_info=True,
+        )
+        raise
+
+    if ctx.stop_event is not None and ctx.stop_event.is_set():
+        raise RuntimeError("writer lock lost during run")
+    written = write_chunk(ctx.storage, ctx.registry, a, b, buffers, ctx.codec)
+    decoded_count = _decoded_row_count(buffers)
+    filtered_count = max(0, log_count - decoded_count)
+
+    if ctx.print_chunk_writes:
+        logger.info(
+            "chunk_written",
+            extra={
+                "chunk_start": a,
+                "chunk_end": b,
+                "logs": log_count,
+                "files": len(written),
+            },
+        )
+        for key in written:
+            logger.info(
+                "chunk_file_written",
+                extra={
+                    "chunk_start": a,
+                    "chunk_end": b,
+                    "chunk_key": key,
+                },
+            )
+
+    logger.info(
+        "chunk_manifest",
+        extra=_chunk_manifest_payload(
+            from_block=a,
+            to_block=b,
+            status="done",
+            attempts=1,
+            error=None,
+            logs=log_count,
+            decoded=decoded_count,
+            filtered=filtered_count,
+            shards=len(written),
+            files_written=len(written),
+            step=ctx.step,
+            subrange_count=subrange_count,
+            duration_s=fetch_duration_s,
+        ),
+    )
+
+    ctx.stats.total_logs += log_count
+    ctx.stats.processed_ok += 1
+    ctx.stats.chunks_written += len(written)
+    if ctx.on_chunk_written is not None:
+        await ctx.on_chunk_written(a, b)
+    logger.info(
+        "chunk_process_complete",
+        extra={
+            "chunk_start": a,
+            "chunk_end": b,
+            "log_count": log_count,
+            "files_written": len(written),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,8 +740,13 @@ class FetchDecodeService:
             raise ValueError("concurrency must be > 0")
         if not config.address:
             raise ValueError("address must not be empty")
+        if not is_hex_address(config.address):
+            raise ValueError("address must be a 0x-prefixed 40-hex Ethereum address")
         if not config.topic0s:
             raise ValueError("topic0s must not be empty")
+        invalid_topic0s = [topic for topic in config.topic0s if not is_topic0(topic)]
+        if invalid_topic0s:
+            raise ValueError("topic0s must contain only 0x-prefixed 64-hex topic signatures")
         for s in seeds:
             if s.start < 0 or s.end < 0:
                 raise ValueError("seed bounds must be >= 0")
@@ -521,7 +795,7 @@ class FetchDecodeService:
         seed_iter = iter(seeds)
         seed_lock = asyncio.Lock()
 
-        async def _worker() -> None:
+        async def _worker(worker_id: int) -> None:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     raise RuntimeError("writer lock lost during run")
@@ -530,9 +804,20 @@ class FetchDecodeService:
                         seed = next(seed_iter)
                     except StopIteration:
                         return
-                await process_interval(ctx, seed)
+                try:
+                    await process_interval(ctx, seed)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"worker {worker_id} failed on seed [{seed.start}, {seed.end}]"
+                    ) from exc
 
-        tasks = [asyncio.create_task(_worker()) for _ in range(worker_count)]
-        await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(_worker(idx)) for idx in range(worker_count)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            first = errors[0]
+            if len(errors) == 1:
+                raise first
+            raise RuntimeError(f"{len(errors)} workers failed; first error: {first}") from first
 
         return stats

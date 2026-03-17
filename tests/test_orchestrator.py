@@ -22,13 +22,14 @@ from defind.orchestration.orchestrator import (
     _cleanup_redundant_old_chunks,
     _plan_seeds_with_tail_extension,
     _plan_startup_small_interval_compaction,
+    _plan_startup_storage_fragment_compaction,
     fetch_decode,
 )
 
 
 def _make_registry() -> EventRegistry:
     spec = EventSpec(
-        topic0="0xabc",
+        topic0=TOPIC0,
         name="TestEvent",
         topic_fields=[TopicFieldSpec("user", 1, "address")],
         data_fields=[DataFieldSpec("amount", 0, "uint256")],
@@ -43,13 +44,14 @@ def _make_registry() -> EventRegistry:
 
 
 ADDR = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"  # valid checksum address
+TOPIC0 = "0x" + "a" * 64
 
 
 def _base_config(**kwargs: Any) -> OrchestratorConfig:
     defaults: dict[str, Any] = dict(
         rpc_url="http://localhost:8545",
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         start_block=0,
         end_block=100,
         protocol_slug="test",
@@ -107,7 +109,7 @@ async def test_fetch_decode_persists_indexer_request_template(mock_rpc: Any) -> 
 @pytest.mark.asyncio
 async def test_fetch_decode_with_work(mock_rpc: Any) -> None:
     mock_log = MagicMock()
-    mock_log.topics = ["0xabc", "0x" + "0" * 24 + "1234567890123456789012345678901234567890"]
+    mock_log.topics = [TOPIC0, "0x" + "0" * 24 + "1234567890123456789012345678901234567890"]
     mock_log.data_hex = "0x" + "00" * 31 + "64"  # amount = 100
     mock_log.block_number = 10
     mock_log.block_timestamp = 1000
@@ -147,7 +149,7 @@ async def test_process_interval_single_block_rpc_error_raises_without_infinite_s
     ctx = ProcessContext(
         rpc=rpc,
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         registry=registry,
         sem=asyncio.Semaphore(1),
         storage=storage,
@@ -177,7 +179,7 @@ async def test_process_interval_does_not_split_on_decode_write_error() -> None:
     ctx = ProcessContext(
         rpc=rpc,
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         registry=registry,
         sem=asyncio.Semaphore(1),
         storage=storage,
@@ -215,7 +217,7 @@ async def test_process_interval_splits_on_rpc_error_code_then_recovers() -> None
     ctx = ProcessContext(
         rpc=rpc,
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         registry=registry,
         sem=asyncio.Semaphore(1),
         storage=storage,
@@ -250,7 +252,7 @@ async def test_process_interval_splits_on_http_413_then_recovers() -> None:
     ctx = ProcessContext(
         rpc=rpc,
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         registry=registry,
         sem=asyncio.Semaphore(1),
         storage=storage,
@@ -283,7 +285,7 @@ async def test_fetch_decode_service_limits_seed_worker_parallelism() -> None:
 
     config = FetchDecodeConfig(
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0],
         step=1,
         chunk_size=1,
         concurrency=3,
@@ -353,6 +355,40 @@ async def test_fetch_decode_listen_continues_after_backfill(mock_rpc: Any) -> No
     assert build_seeds_mock.call_args_list[0].kwargs["end"] == 100
     assert build_seeds_mock.call_args_list[1].kwargs["start"] == 101
     assert build_seeds_mock.call_args_list[1].kwargs["end"] == 102
+
+
+@pytest.mark.asyncio
+async def test_fetch_decode_runs_startup_storage_fragment_compaction_before_normal_planning(mock_rpc: Any) -> None:
+    registry = _make_registry()
+    mock_storage = MagicMock()
+    mock_storage.exists.return_value = False
+    mock_storage.list_keys.return_value = []
+
+    service = MagicMock()
+    service.run = AsyncMock(return_value=ProcessStats(processed_ok=1, chunks_written=1))
+
+    with (
+        patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
+        patch("defind.orchestration.orchestrator._build_storage", return_value=(mock_storage, "/tmp/test/pool")),
+        patch(
+            "defind.orchestration.orchestrator.load_done_chunks",
+            side_effect=[[(100, 149)], [(0, 149)], [(0, 149)]],
+        ),
+        patch("defind.orchestration.orchestrator.load_done_chunks_from_index", return_value=[(100, 149)]),
+        patch("defind.orchestration.orchestrator.FetchDecodeService", return_value=service),
+        patch("defind.orchestration.orchestrator._plan_startup_small_interval_compaction", return_value=[]),
+        patch(
+            "defind.orchestration.orchestrator._plan_startup_storage_fragment_compaction",
+            return_value=[WorkSeed(0, 149)],
+        ),
+    ):
+        await fetch_decode(
+            config=_base_config(start_block=0, end_block=149),
+            registry=registry,
+        )
+
+    assert service.run.await_count == 1
+    assert service.run.await_args.kwargs["seeds"] == [WorkSeed(0, 149)]
 
 
 @pytest.mark.asyncio
@@ -509,6 +545,28 @@ def test_plan_startup_small_interval_compaction_works_when_global_coverage_is_hu
         done_chunks=[(0, 199), (200, 250), (251, 260)],
     )
     assert seeds == [WorkSeed(200, 260)]
+
+
+def test_plan_startup_storage_fragment_compaction_repairs_adjacent_tails_with_incomplete_intersection() -> None:
+    storage = MagicMock()
+    storage.list_keys.side_effect = lambda prefix: {
+        "E1/": [
+            "E1/chunk_0000000000_0000000099.parquet",
+            "E1/chunk_0000000100_0000000149.parquet",
+        ],
+        "E2/": [
+            "E2/chunk_0000000100_0000000149.parquet",
+        ],
+    }.get(prefix, [])
+
+    seeds = _plan_startup_storage_fragment_compaction(
+        storage=storage,
+        event_names=["E1", "E2"],
+        anchor_start=0,
+        chunk_size=200,
+    )
+
+    assert seeds == [WorkSeed(0, 149)]
 
 
 def test_cleanup_redundant_old_chunks_deletes_orphan_partials() -> None:

@@ -31,13 +31,15 @@ from defind.orchestration.orchestrator import (
 )
 
 ADDR = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+TOPIC0_A = "0x" + "a" * 64
+TOPIC0_B = "0x" + "b" * 64
 
 
 def _base_config(**kwargs: Any) -> OrchestratorConfig:
     defaults: dict[str, Any] = dict(
         rpc_url="http://localhost:8545",
         address=ADDR,
-        topic0s=["0xabc"],
+        topic0s=[TOPIC0_A],
         start_block=0,
         end_block=100,
         protocol_slug="test",
@@ -50,7 +52,7 @@ def _base_config(**kwargs: Any) -> OrchestratorConfig:
 
 def _make_registry() -> EventRegistry:
     spec = EventSpec(
-        topic0="0xabc",
+        topic0=TOPIC0_A,
         name="TestEvent",
         topic_fields=[TopicFieldSpec("user", 1, "address")],
         data_fields=[DataFieldSpec("amount", 0, "uint256")],
@@ -146,6 +148,14 @@ def test_validate_runtime_config_guardrails() -> None:
 
     cfg = _base_config(topic0s=[])
     with pytest.raises(ValueError, match="topic0s must not be empty"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(address="0xabc")
+    with pytest.raises(ValueError, match="0x-prefixed 40-hex Ethereum address"):
+        _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
+
+    cfg = _base_config(topic0s=["0xabc"])
+    with pytest.raises(ValueError, match="0x-prefixed 64-hex topic signatures"):
         _validate_runtime_config(config=cfg, effective_chunk_size=cfg.chunk_size or cfg.step)
 
     cfg = _base_config(protocol_slug="../oops")
@@ -474,12 +484,11 @@ async def test_fetch_decode_uses_index_when_chunk_scan_fails(mock_rpc: Any) -> N
 @pytest.mark.asyncio
 async def test_fetch_decode_single_writer_guard_blocks_other_owner(mock_rpc: Any) -> None:
     registry = _make_registry()
-    storage = MagicMock()
-    storage.exists.return_value = True
-    storage.read_json.return_value = {
+    storage = _MemJsonStorage()
+    storage.write_json("_meta/writer.lock.json", {
         "owner_id": "another-owner",
         "expires_at_s": 4_000_000_000,
-    }
+    })
 
     with (
         patch("defind.orchestration.orchestrator.RPC", return_value=mock_rpc),
@@ -506,14 +515,14 @@ async def test_fetch_decode_rejects_empty_registry() -> None:
 @pytest.mark.asyncio
 async def test_fetch_decode_rejects_duplicate_event_names() -> None:
     spec1 = EventSpec(
-        topic0="0xaaa",
+        topic0=TOPIC0_A,
         name="SameName",
         topic_fields=[],
         data_fields=[],
         projection={},
     )
     spec2 = EventSpec(
-        topic0="0xbbb",
+        topic0=TOPIC0_B,
         name="SameName",
         topic_fields=[],
         data_fields=[],
@@ -526,7 +535,7 @@ async def test_fetch_decode_rejects_duplicate_event_names() -> None:
 
     with pytest.raises(ValueError, match="event names must be unique"):
         await fetch_decode(
-            config=_base_config(topic0s=["0xaaa", "0xbbb"]),
+            config=_base_config(topic0s=[TOPIC0_A, TOPIC0_B]),
             registry=registry,
         )
 
@@ -534,7 +543,7 @@ async def test_fetch_decode_rejects_duplicate_event_names() -> None:
 @pytest.mark.asyncio
 async def test_fetch_decode_rejects_uppercase_registry_keys() -> None:
     spec = EventSpec(
-        topic0="0xabc",
+        topic0=TOPIC0_A,
         name="Event",
         topic_fields=[],
         data_fields=[],
@@ -542,7 +551,7 @@ async def test_fetch_decode_rejects_uppercase_registry_keys() -> None:
     )
     with pytest.raises(ValueError, match="topic0 keys must be lower-case"):
         await fetch_decode(
-            config=_base_config(topic0s=["0xABC"]),
+            config=_base_config(topic0s=[f"0x{'A' * 64}"]),
             registry={"0xABC": spec},
         )
 
@@ -550,7 +559,7 @@ async def test_fetch_decode_rejects_uppercase_registry_keys() -> None:
 @pytest.mark.asyncio
 async def test_fetch_decode_rejects_registry_key_spec_mismatch() -> None:
     spec = EventSpec(
-        topic0="0xbbb",
+        topic0=TOPIC0_B,
         name="Event",
         topic_fields=[],
         data_fields=[],
@@ -558,15 +567,15 @@ async def test_fetch_decode_rejects_registry_key_spec_mismatch() -> None:
     )
     with pytest.raises(ValueError, match="registry key must match spec.topic0"):
         await fetch_decode(
-            config=_base_config(topic0s=["0xaaa"]),
-            registry={"0xaaa": spec},
+            config=_base_config(topic0s=[TOPIC0_A]),
+            registry={TOPIC0_A: spec},
         )
 
 
 @pytest.mark.asyncio
 async def test_fetch_decode_rejects_unsafe_event_names() -> None:
     spec = EventSpec(
-        topic0="0xabc",
+        topic0=TOPIC0_A,
         name="Bad/Event",
         topic_fields=[],
         data_fields=[],
@@ -574,8 +583,8 @@ async def test_fetch_decode_rejects_unsafe_event_names() -> None:
     )
     with pytest.raises(ValueError, match="must not contain path separators"):
         await fetch_decode(
-            config=_base_config(topic0s=["0xabc"]),
-            registry={"0xabc": spec},
+            config=_base_config(topic0s=[TOPIC0_A]),
+            registry={TOPIC0_A: spec},
         )
 
 
@@ -624,7 +633,7 @@ async def test_heartbeat_loop_writes_json_and_warns_on_lag_threshold() -> None:
         last_indexed_block=90,
         chain_head_block=120,
         address="0x0000000000000000000000000000000000000001",
-        rpc_url="https://rpc.example.org",
+        rpc_endpoint="https://mainnet.chainnodes.org",
     )
 
     with (
@@ -649,5 +658,5 @@ async def test_heartbeat_loop_writes_json_and_warns_on_lag_threshold() -> None:
     assert payload["chain_head_block"] == 120
     assert payload["lag_blocks"] == 30
     assert payload["address"] == "0x0000000000000000000000000000000000000001"
-    assert payload["rpc_url"] == "https://rpc.example.org"
+    assert payload["rpc_endpoint"] == "https://mainnet.chainnodes.org"
     assert warning_mock.call_count >= 1
