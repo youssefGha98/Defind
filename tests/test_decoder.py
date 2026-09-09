@@ -32,7 +32,7 @@ def test_decode_event_success(sample_registry: EventRegistry) -> None:
     assert parsed is not None
     assert parsed.name == "TestEvent"
     assert parsed.values["user"] == "0x1234567890123456789012345678901234567890"
-    assert parsed.values["amount"] == "100"
+    assert parsed.values["amount"] == 100
 
 
 def test_decode_event_unknown_topic(sample_registry: EventRegistry) -> None:

@@ -16,7 +16,7 @@ from eth_utils import to_checksum_address  # type: ignore[attr-defined]
 
 from defind.core.models import Meta
 from defind.decoding.specs import EventRegistry, EventSpec, resolve_projection_ref
-from defind.decoding.utils import parse_data_word, parse_topic_field, word_at
+from defind.decoding.utils import parse_data_fields, parse_topic_field, word_at
 
 # ---------- parsed event ----------
 
@@ -103,15 +103,9 @@ def decode_event(
             return None
         topic_vals[tf.name] = parse_topic_field(topics[tf.index], tf)
 
-    # Parse data words (ensure data size)
-    if spec.data_fields:
-        need_words = max(df.word_index for df in spec.data_fields) + 1
-        if len(data) < 32 * need_words:
-            return None
-
-    data_vals: dict[str, Any] = {}
-    for df in spec.data_fields:
-        data_vals[df.name] = parse_data_word(word_at(data, df.word_index), df.type)
+    data_vals = parse_data_fields(data, spec.data_fields)
+    if data_vals is None:
+        return None
 
     # Drop if all specified fields are zero (post-parse)
     if _should_skip_all_zero_fields(spec, data_vals):
@@ -120,10 +114,7 @@ def decode_event(
     # Dynamically resolve ALL projection keys
     resolved: dict[str, Any] = {}
     for out_key, ref in spec.projection.items():
-        v = resolve_projection_ref(ref, topic_vals, data_vals)
-        if isinstance(v, int):
-            v = str(v)  # Arrow safety for big ints
-        resolved[out_key] = v
+        resolved[out_key] = resolve_projection_ref(ref, topic_vals, data_vals)
 
     return ParsedEvent(
         name=spec.name,

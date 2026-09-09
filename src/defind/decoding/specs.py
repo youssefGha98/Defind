@@ -67,7 +67,11 @@ class TopicFieldSpec:
 
 @dataclass(frozen=True)
 class DataFieldSpec:
-    """Describe one 32-byte ABI word in the data section (0-based word index)."""
+    """Describe one non-indexed ABI field in the data section.
+
+    `word_index` is the 0-based ABI argument position for contiguous event data.
+    Sparse/manual specs may also use it as a direct 32-byte word index fallback.
+    """
 
     name: str
     word_index: int

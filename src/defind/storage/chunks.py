@@ -26,7 +26,7 @@ import pyarrow as pa
 
 from defind.core.interfaces import IChunkStorage
 from defind.core.models import BASE_FIELDS
-from defind.decoding.specs import EventRegistry, EventSpec
+from defind.decoding.specs import EventRegistry, EventSpec, ProjectionRefs
 
 # Sort order applied to every written table
 _SORT_KEYS = [
@@ -74,6 +74,65 @@ def parse_chunk_key(key: str) -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 
+def _abi_int_width(typ: str) -> int:
+    if typ == "int":
+        return 256
+    if typ == "uint":
+        return 256
+    if typ.startswith("int"):
+        return int(typ[3:])
+    if typ.startswith("uint"):
+        return int(typ[4:])
+    raise ValueError(f"unsupported integer ABI type: {typ}")
+
+
+def _projection_arrow_type(spec: EventSpec, out_key: str) -> pa.DataType:
+    ref = spec.projection[out_key]
+    if isinstance(ref, ProjectionRefs.Constant) or ref is None:
+        return pa.string()
+
+    field_types = {
+        field.name: field.type
+        for field in [*spec.topic_fields, *spec.data_fields]
+    }
+    typ = field_types.get(ref.name)
+    if typ is None:
+        return pa.string()
+    if typ == "address":
+        return pa.string()
+    if typ == "bool":
+        return pa.bool_()
+    if typ.startswith("int"):
+        bits = _abi_int_width(typ)
+        if bits <= 8:
+            return pa.int8()
+        if bits <= 16:
+            return pa.int16()
+        if bits <= 32:
+            return pa.int32()
+        if bits <= 64:
+            return pa.int64()
+        return pa.string()
+    if typ.startswith("uint"):
+        bits = _abi_int_width(typ)
+        if bits <= 8:
+            return pa.uint8()
+        if bits <= 16:
+            return pa.uint16()
+        if bits <= 32:
+            return pa.uint32()
+        if bits <= 64:
+            return pa.uint64()
+        return pa.string()
+    return pa.string()
+
+
+def _coerce_projection_values(values: list[Any], dtype: pa.DataType) -> list[Any]:
+    if pa.types.is_string(dtype):
+        return [None if value is None else str(value) for value in values]
+    return values
+
+
 def empty_table_for_spec(spec: EventSpec) -> pa.Table:
     """Build an empty Arrow table with the correct schema for an event spec.
 
@@ -82,8 +141,9 @@ def empty_table_for_spec(spec: EventSpec) -> pa.Table:
     fields = [pa.field(name, dtype) for name, dtype in BASE_FIELDS]
     arrays: dict[str, pa.Array] = {name: pa.array([], type=dtype) for name, dtype in BASE_FIELDS}
     for col_name in sorted(spec.projection.keys()):
-        fields.append(pa.field(col_name, pa.string()))
-        arrays[col_name] = pa.array([], type=pa.string())
+        dtype = _projection_arrow_type(spec, col_name)
+        fields.append(pa.field(col_name, dtype))
+        arrays[col_name] = pa.array([], type=dtype)
     schema = pa.schema(fields)
     return pa.Table.from_pydict(arrays, schema=schema)
 
@@ -105,8 +165,10 @@ def _build_table(ev_buf: dict[str, list[Any]], spec: EventSpec) -> pa.Table:
         "event": pa.array([spec.name] * n, type=pa.string()),
     }
     for out_key in sorted(spec.projection.keys()):
-        fields.append(pa.field(out_key, pa.string()))
-        arrays[out_key] = pa.array(ev_buf.get(out_key, [None] * n), type=pa.string())
+        dtype = _projection_arrow_type(spec, out_key)
+        values = _coerce_projection_values(ev_buf.get(out_key, [None] * n), dtype)
+        fields.append(pa.field(out_key, dtype))
+        arrays[out_key] = pa.array(values, type=dtype)
     schema = pa.schema(fields)
     return pa.Table.from_pydict(arrays, schema=schema).sort_by(_SORT_KEYS)
 

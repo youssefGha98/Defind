@@ -153,6 +153,45 @@ class RPC(IEvmLogsProvider):
             )
         return int(data["result"], 16)
 
+    async def chain_id(self) -> int:
+        """Return the current chain id as an int."""
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+        data = await self._post_json(payload)
+        if "error" in data:
+            e = data["error"]
+            raise RPCError(
+                f"RPC error: {e.get('code')} {e.get('message')}",
+                url=self.url,
+                rpc_method="eth_chainId",
+                rpc_code=e.get("code"),
+                rpc_message=e.get("message"),
+                rpc_data=e.get("data"),
+            )
+        return int(data["result"], 16)
+
+    async def get_code(self, *, address: str, block: int | str = "latest") -> str:
+        """Return contract code at a given block (hex string)."""
+        normalized_address = address.strip()
+        if not is_hex_address(normalized_address):
+            raise ValueError("address must be a 0x-prefixed 40-hex Ethereum address")
+        if isinstance(block, int):
+            block_param = to_hex_block(block)
+        else:
+            block_param = str(block)
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_getCode", "params": [normalized_address, block_param]}
+        data = await self._post_json(payload)
+        if "error" in data:
+            e = data["error"]
+            raise RPCError(
+                f"RPC error: {e.get('code')} {e.get('message')}",
+                url=self.url,
+                rpc_method="eth_getCode",
+                rpc_code=e.get("code"),
+                rpc_message=e.get("message"),
+                rpc_data=e.get("data"),
+            )
+        return str(data.get("result") or "0x")
+
     async def get_logs(
         self,
         *,

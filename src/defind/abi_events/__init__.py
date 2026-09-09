@@ -32,37 +32,89 @@ def get_event_topic0(event: AbiEvent) -> str:
     return "0x" + event_signature_to_log_topic(get_event_signature(event)).hex()
 
 
+def _event_input_name(*, raw_name: str, is_indexed: bool, field_index: int) -> str:
+    cleaned = raw_name.strip()
+    if cleaned:
+        return cleaned
+    prefix = "topic" if is_indexed else "data"
+    return f"{prefix}_{field_index}"
+
+
+def _iter_event_inputs(
+    event: AbiEvent,
+) -> list[tuple[str, AbiInput, bool, int]]:
+    topic_field_offset = 1  # topic[0] is the event signature hash
+    data_field_offset = 0
+    out: list[tuple[str, AbiInput, bool, int]] = []
+
+    for event_input in event.inputs:
+        is_indexed = bool(event_input.indexed)
+        field_index = topic_field_offset if is_indexed else data_field_offset
+        input_name = _event_input_name(
+            raw_name=event_input.name,
+            is_indexed=is_indexed,
+            field_index=field_index,
+        )
+        out.append((input_name, event_input, is_indexed, field_index))
+        if is_indexed:
+            topic_field_offset += 1
+        else:
+            data_field_offset += 1
+
+    return out
+
+
 def get_event_topic_field_specs(event: AbiEvent) -> list[TopicFieldSpec]:
     return [
-        TopicFieldSpec(event_input.name, event_input_idx + 1, event_input.type)
-        for event_input_idx, event_input in enumerate(
-            [event_input for event_input in event.inputs if event_input.indexed]
-        )
+        TopicFieldSpec(input_name, field_index, event_input.type)
+        for input_name, event_input, is_indexed, field_index in _iter_event_inputs(event)
+        if is_indexed
     ]
 
 
 def get_event_data_field_specs(event: AbiEvent) -> list[DataFieldSpec]:
     return [
-        DataFieldSpec(event_input.name, event_input_idx, event_input.type)
-        for event_input_idx, event_input in enumerate(
-            [event_input for event_input in event.inputs if not event_input.indexed]
-        )
+        DataFieldSpec(input_name, field_index, event_input.type)
+        for input_name, event_input, is_indexed, field_index in _iter_event_inputs(event)
+        if not is_indexed
     ]
 
 
-def get_event_projection_ref(event_input: AbiInput) -> ProjectionRefs.TopicRef | ProjectionRefs.DataRef:
-    if event_input.indexed:
-        return ProjectionRefs.TopicRef(name=event_input.name)
-    return ProjectionRefs.DataRef(name=event_input.name)
+def get_event_projection_ref(
+    *,
+    input_name: str,
+    is_indexed: bool,
+) -> ProjectionRefs.TopicRef | ProjectionRefs.DataRef:
+    if is_indexed:
+        return ProjectionRefs.TopicRef(name=input_name)
+    return ProjectionRefs.DataRef(name=input_name)
 
 
 def get_event_spec(event: AbiEvent) -> EventSpec:
+    event_inputs = _iter_event_inputs(event)
+    topic_fields = [
+        TopicFieldSpec(input_name, field_index, event_input.type)
+        for input_name, event_input, is_indexed, field_index in event_inputs
+        if is_indexed
+    ]
+    data_fields = [
+        DataFieldSpec(input_name, field_index, event_input.type)
+        for input_name, event_input, is_indexed, field_index in event_inputs
+        if not is_indexed
+    ]
+    projection = {
+        input_name: get_event_projection_ref(
+            input_name=input_name,
+            is_indexed=is_indexed,
+        )
+        for input_name, _event_input, is_indexed, _field_index in event_inputs
+    }
     return EventSpec(
         topic0=get_event_topic0(event),
         name=event.name,
-        topic_fields=get_event_topic_field_specs(event),
-        data_fields=get_event_data_field_specs(event),
-        projection={event_input.name: get_event_projection_ref(event_input) for event_input in event.inputs},
+        topic_fields=topic_fields,
+        data_fields=data_fields,
+        projection=projection,
         # fast_zero_words=(1, 2, 3),
         # drop_if_all_zero_fields=("liquidity", "amount0", "amount1"),
     )

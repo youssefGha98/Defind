@@ -34,6 +34,30 @@ def test_make_event_registry_from_abi() -> None:
     assert set(registry.keys()) == set([get_event_topic0(event) for event in events.values()])
 
 
+def test_make_event_registry_from_abi_assigns_default_names_to_unnamed_inputs() -> None:
+    registry = make_event_registry_from_abi(
+        [
+            {
+                "anonymous": False,
+                "inputs": [
+                    {"indexed": True, "internalType": "address", "name": "", "type": "address"},
+                    {"indexed": False, "internalType": "uint256", "name": "", "type": "uint256"},
+                ],
+                "name": "TestEvent",
+                "type": "event",
+            }
+        ]
+    )
+
+    spec = next(iter(registry.values()))
+    assert spec.topic_fields == [TopicFieldSpec("topic_1", 1, "address")]
+    assert spec.data_fields == [DataFieldSpec("data_0", 0, "uint256")]
+    assert spec.projection == {
+        "topic_1": ProjectionRefs.TopicRef(name="topic_1"),
+        "data_0": ProjectionRefs.DataRef(name="data_0"),
+    }
+
+
 def test_get_events_from_abi_rejects_entry_missing_type() -> None:
     with pytest.raises(ValueError, match="missing 'type'"):
         get_events_from_abi([{"name": "Swap"}])

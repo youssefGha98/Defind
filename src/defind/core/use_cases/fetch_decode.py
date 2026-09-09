@@ -400,7 +400,7 @@ def _decode_logs_into(
         ev_buf["log_index"].append(meta.log_index)
         ev_buf["contract"].append(pe.pool)
         for out_key, v in pe.values.items():
-            ev_buf[out_key].append(None if v is None else str(v))
+            ev_buf[out_key].append(v)
 
 
 # ---------------------------------------------------------------------------

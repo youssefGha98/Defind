@@ -1,0 +1,3 @@
+address,protocol_slug,contract_slug,start_block,end_block
+0x820FB8127a689327C863de8433278d6181123982,arrakis,meta_vault_factory,20540819,latest
+0x31CcDb5bd6322483bebD0787e1DABd1Bf1f14946,gamma,hyper_registry,13659998,latest
